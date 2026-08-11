@@ -23,7 +23,7 @@
   },
   "devDependencies": {
     "@resvg/resvg-wasm": "^2.6.2",
-    "electron": "^37.2.0",
+    "electron": "^43.3.0",
     "electron-builder": "^26.0.12",
     "png2icons": "^2.0.1"
   },
