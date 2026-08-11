@@ -100,19 +100,12 @@ jobs:
           bun run icons
           git diff --exit-code -- build/
 
-      # Resolve the release tag: the pushed tag on tag runs, otherwise
-      # v<package version> for manual workflow_dispatch runs.
-      - name: Resolve release tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          else
-            VERSION=$(bun -e "console.log(JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version)")
-            echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-          fi
-
+      # electron-builder publishes to the release for the pushed tag: with the
+      # default vPrefixedTagName its computed tag (v<package version>) matches
+      # the vX.Y.Z tag publish-release.mjs pushes. (Do NOT pass
+      # --config.publish.tag=… — `tag` is not a publish option in
+      # electron-builder 26 and fails config schema validation.)
       - name: Build installers and publish to GitHub Releases
-        run: bunx electron-builder ${{ matrix.electron-builder-args }} --publish always --config.publish.tag=${{ steps.tag.outputs.tag }}
+        run: bunx electron-builder ${{ matrix.electron-builder-args }} --publish always
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
