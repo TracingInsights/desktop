@@ -1,9 +1,13 @@
 {
   "name": "tif1ai-desktop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "TracingInsights desktop app — runs a localhost bridge so ChatGPT Codex and Grok (SuperGrok) calls go through the user's machine instead of the server.",
-  "author": "TracingInsights",
+  "author": {
+    "name": "TracingInsights",
+    "email": "101667461+TracingInsights@users.noreply.github.com"
+  },
+  "homepage": "https://github.com/TracingInsights/desktop",
   "type": "module",
   "main": "src/main.mjs",
   "scripts": {

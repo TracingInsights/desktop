@@ -62,7 +62,8 @@ jobs:
     timeout-minutes: 60
     env:
       # Optional code-signing credentials — see header comment. Absent secrets
-      # are simply unset and electron-builder skips signing.
+      # render as EMPTY STRINGS (not unset); the build step below unsets them
+      # so electron-builder skips signing instead of crashing.
       CSC_LINK: ${{ secrets.CSC_LINK }}
       CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
       WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
@@ -106,6 +107,18 @@ jobs:
       # --config.publish.tag=… — `tag` is not a publish option in
       # electron-builder 26 and fails config schema validation.)
       - name: Build installers and publish to GitHub Releases
-        run: bunx electron-builder ${{ matrix.electron-builder-args }} --publish always
+        shell: bash
+        run: |
+          # Absent secrets arrive as empty strings, and electron-builder >= 26
+          # treats an explicitly-empty CSC_LINK as a SET value: the mac packager
+          # then resolves '' against the project dir and dies with
+          # "<projectDir> not a file" (issue #5514). Unset the empty signing
+          # vars so unsigned builds skip signing cleanly.
+          for var in CSC_LINK CSC_KEY_PASSWORD CSC_INSTALLER_LINK \
+            CSC_INSTALLER_KEY_PASSWORD WIN_CSC_LINK WIN_CSC_KEY_PASSWORD \
+            APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!var}" ]; then unset "$var"; fi
+          done
+          bunx electron-builder ${{ matrix.electron-builder-args }} --publish always
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
