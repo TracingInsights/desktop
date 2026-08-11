@@ -103,7 +103,7 @@ curl -H 'x-bridge-token: demo-token-1234567890' http://127.0.0.1:4318/api/codex/
 
 ```bash
 cd desktop
-bun run icons            # regenerate build/icon.{png,icns,ico} from assets/icon.svg
+bun run icons            # regenerate build/icon.{png,icns,ico} from assets/icon.png
 bun run pack             # unpacked build in release/ (fast, for testing)
 bun run dist:mac         # dmg + zip (requires macOS)
 bun run dist:win         # nsis installer
@@ -112,10 +112,11 @@ bun run publish:release  # ship a release via the public mirror repo (see below)
 ```
 
 **Icons.** `build/icon.png` (1024×1024), `build/icon.icns`, and
-`build/icon.ico` are generated from `assets/icon.svg` by
+`build/icon.ico` are generated from `assets/icon.png` (the TracingInsights
+logo — `#00ff00` green field, dark monogram) by
 `scripts/generate-icons.mjs` (resvg-wasm → PNG, png2icons → ICNS/ICO — pure
-JS, no native toolchain). The script self-checks the render (background, T
-monogram, checkered ribbon pixels) and the output formats before writing the
+JS, no native toolchain). The script self-checks the render (green
+background, dark monogram pixels) and the output formats before writing the
 files. Commit the generated `build/` files; electron-builder reads them via
 the `mac.icon` / `win.icon` / `linux.icon` keys in `electron-builder.yml`.
 
@@ -204,7 +205,7 @@ Program, $99/yr).
 
 Publishing is protected from mid-flight cancellation
 (`concurrency: cancel-in-progress: false`) and the workflow regenerates the
-icons from `assets/icon.svg` and fails if the committed `build/` icons have
+icons from `assets/icon.png` and fails if the committed `build/` icons have
 drifted (same contract as the stats manifest checks).
 
 ## Repo integration points
@@ -230,7 +231,7 @@ drifted (same contract as the stats manifest checks).
 - Static model catalogs: `desktop/src/model-catalogs.mjs` is the shared source used by
   both the bridge and the site routes under
   `src/routes/api/{codex,xai}/models/+server.ts`
-- App icons: `assets/icon.svg` (design source) → generated `build/icon.*`
+- App icons: `assets/icon.png` (logo source) → generated `build/icon.*`
 
 ## Known limitations
 

@@ -1,19 +1,22 @@
 /**
- * Generate the desktop app icons from desktop/assets/icon.svg:
+ * Generate the desktop app icons from desktop/assets/icon.png — the
+ * TracingInsights logo (#00ff00 green field, dark monogram + wordmark):
  *
  *   build/icon.png  — 1024×1024 (Linux + master source)
  *   build/icon.icns — macOS (multi-size, incl. 1024 for Retina)
  *   build/icon.ico  — Windows (16–256)
  *
- * Pipeline: resvg-wasm renders the SVG → 1024 PNG; png2icons converts the
- * PNG to ICNS/ICO in pure JS (no native tools, works on any platform).
+ * Pipeline: the 400×400 logo PNG is embedded as a data URL in a tiny SVG
+ * wrapper, resvg-wasm renders it → 1024 PNG; png2icons converts the PNG to
+ * ICNS/ICO in pure JS (no native tools, works on any platform).
  *
  * Run:  cd desktop && bun run icons
  *       (root: bun run desktop:icons)
  *
  * The script self-verifies: it decodes the PNG and samples a few pixels
- * (background, T bar, T stem, checkered cell) so a broken render is caught
- * immediately instead of shipping a blank icon.
+ * (green background, dark monogram strokes) plus the green/dark pixel
+ * fractions, so a broken render is caught immediately instead of shipping
+ * a blank icon.
  */
 import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -26,7 +29,7 @@ const require_ = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DESKTOP_DIR = join(__dirname, '..');
 const BUILD_DIR = join(DESKTOP_DIR, 'build');
-const SOURCE_SVG = join(DESKTOP_DIR, 'assets', 'icon.svg');
+const SOURCE_PNG = join(DESKTOP_DIR, 'assets', 'icon.png');
 const ICON_SIZE = 1024;
 
 // ---------------------------------------------------------------------------
@@ -156,22 +159,14 @@ function hex({ r, g, b, a }) {
   return `#${[r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('')}${a < 255 ? `/${a}` : ''}`;
 }
 
-function isNearRose(p) {
-  return p.r > 150 && p.g < 130 && p.b < 160 && p.a > 200;
+function isNearGreen(p) {
+  // Logo background: #00ff00.
+  return p.g > 200 && p.r < 80 && p.b < 80 && p.a > 200;
 }
 
 function isNearDark(p) {
-  return p.r < 48 && p.g < 48 && p.b < 56 && p.a > 200;
-}
-function isCheckeredCell(p) {
-  // Checker cells are either near-white or near-black.
-  return (
-    (p.r > 200 && p.g > 200 && p.b > 200) || (p.r < 48 && p.g < 48 && p.b < 56)
-  );
-}
-
-function isNearWhite(p) {
-  return p.r > 200 && p.g > 200 && p.b > 200 && p.a > 200;
+  // Logo monogram strokes: near-black / #011627 navy.
+  return p.r < 60 && p.g < 60 && p.b < 60 && p.a > 200;
 }
 
 // ---------------------------------------------------------------------------
@@ -220,16 +215,21 @@ async function loadPng2Icons() {
 // ---------------------------------------------------------------------------
 
 await ensureWasm();
-const svg = readFileSync(SOURCE_SVG, 'utf8');
+// Wrap the logo PNG in an SVG so resvg can rasterize it at 1024 (data URLs
+// are decoded internally — no resource loading needed).
+const logo = readFileSync(SOURCE_PNG);
+const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${ICON_SIZE}" height="${ICON_SIZE}"><image href="data:image/png;base64,${logo.toString('base64')}" width="${ICON_SIZE}" height="${ICON_SIZE}"/></svg>`;
 
-console.log('rendering icon.svg → icon.png …');
+console.log('rendering icon.png → 1024×1024 icon.png …');
 const png = renderPng(svg, ICON_SIZE);
 
-// Pixel self-check against the design:
-//   corner        ≈ dark background
-//   (512, 330)    T bar            (rose)
-//   (512, 500)    T stem           (rose)
-//   (300, 780)    checkered cell   (white or black)
+// Pixel self-check against the logo (400-space points × 2.56 → 1024-space):
+//   corners           green background  (#00ff00)
+//   (512, 215)        monogram top bar  (dark)
+//   (317, 389)        monogram left     (dark)
+//   (596, 512)        monogram lower    (dark)
+// Plus whole-image green/dark fractions so a blank or swapped render fails
+// even if every sample point happens to land on a valid color.
 const decoded = decodePng(png);
 if (decoded.width !== ICON_SIZE || decoded.height !== ICON_SIZE) {
   throw new Error(
@@ -237,21 +237,39 @@ if (decoded.width !== ICON_SIZE || decoded.height !== ICON_SIZE) {
   );
 }
 const samples = {
-  corner: samplePixel(decoded, 8, 8),
-  bar: samplePixel(decoded, 512, 330),
-  stem: samplePixel(decoded, 512, 500),
-  checkerDark: samplePixel(decoded, 300, 780),
-  checkerWhite: samplePixel(decoded, 240, 770)
+  cornerTL: samplePixel(decoded, 8, 8),
+  cornerBR: samplePixel(decoded, ICON_SIZE - 8, ICON_SIZE - 8),
+  bar: samplePixel(decoded, 512, 215),
+  stem: samplePixel(decoded, 317, 389),
+  lower: samplePixel(decoded, 596, 512)
 };
 for (const [name, p] of Object.entries(samples)) {
-  console.log(`  ${name.padEnd(7)} ${hex(p)}`);
+  console.log(`  ${name.padEnd(8)} ${hex(p)}`);
 }
+let greenPixels = 0;
+let darkPixels = 0;
+const total = decoded.width * decoded.height;
+for (let i = 0; i < total; i += 1) {
+  const p = {
+    r: decoded.data[i * 4],
+    g: decoded.data[i * 4 + 1],
+    b: decoded.data[i * 4 + 2],
+    a: decoded.data[i * 4 + 3]
+  };
+  if (isNearGreen(p)) greenPixels += 1;
+  else if (isNearDark(p)) darkPixels += 1;
+}
+const greenPct = (100 * greenPixels) / total;
+const darkPct = (100 * darkPixels) / total;
+console.log(`  green ${greenPct.toFixed(1)}% · dark ${darkPct.toFixed(1)}%`);
 const checks = {
-  'corner is dark': isNearDark(samples.corner),
-  'T bar is rose': isNearRose(samples.bar),
-  'T stem is rose': isNearRose(samples.stem),
-  'checker dark cell': isCheckeredCell(samples.checkerDark),
-  'checker white cell': isNearWhite(samples.checkerWhite)
+  'corner TL is green': isNearGreen(samples.cornerTL),
+  'corner BR is green': isNearGreen(samples.cornerBR),
+  'monogram bar is dark': isNearDark(samples.bar),
+  'monogram left is dark': isNearDark(samples.stem),
+  'monogram lower is dark': isNearDark(samples.lower),
+  'majority green background': greenPct > 50,
+  'monogram present (>5% dark)': darkPct > 5
 };
 const failed = Object.entries(checks).filter(([, ok]) => !ok);
 if (failed.length > 0) {

@@ -94,9 +94,9 @@ jobs:
         run: bun install --frozen-lockfile
 
       # The generated icons are committed; regeneration must be a no-op.
-      # Failing here catches an icon.svg change whose build/ files were not
-      # synced (same contract as the stats manifest drift checks).
-      - name: Verify committed icons match the source SVG
+      # Failing here catches an assets/icon.png change whose build/ files
+      # were not synced (same contract as the stats manifest drift checks).
+      - name: Verify committed icons match the source logo
         run: |
           bun run icons
           git diff --exit-code -- build/

@@ -1,6 +1,6 @@
 # electron-builder configuration (desktop/). Run from this directory:
 #   bun install
-#   bun run icons             # regenerate build/icon.{png,icns,ico} from assets/icon.svg
+#   bun run icons             # regenerate build/icon.{png,icns,ico} from assets/icon.png
 #   bun run pack              # unpacked build in release/ (fast, for testing)
 #   bun run dist:mac          # dmg + zip
 #   bun run dist:win          # nsis installer
