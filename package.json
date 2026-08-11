@@ -1,0 +1,33 @@
+{
+  "name": "tif1ai-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TracingInsights desktop app — runs a localhost bridge so ChatGPT Codex and Grok (SuperGrok) calls go through the user's machine instead of the server.",
+  "author": "TracingInsights",
+  "type": "module",
+  "main": "src/main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "icons": "bun run scripts/generate-icons.mjs",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux",
+    "publish:release": "bun run scripts/publish-release.mjs",
+    "e2e": "bun ../tests/scripts/desktop-e2e-cdp.mjs"
+  },
+  "dependencies": {
+    "electron-updater": "^6.0.0"
+  },
+  "devDependencies": {
+    "@resvg/resvg-wasm": "^2.6.2",
+    "electron": "^37.2.0",
+    "electron-builder": "^26.0.12",
+    "png2icons": "^2.0.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

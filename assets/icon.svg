@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!--
+    TracingInsights desktop app icon (source of truth for desktop/build/*).
+    Design language follows the site favicon: near-black ground + rose (#f43f5e)
+    monogram, with a checkered-flag ribbon for the F1 identity.
+
+    Rendered to PNG/ICNS/ICO by desktop/scripts/generate-icons.mjs (resvg-wasm
+    + png2icons). Full-bleed square on purpose: macOS applies its own squircle
+    mask, Windows/Linux show the square as-is. All content sits inside a ~56%
+    center safe area so nothing clips at small sizes.
+  -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#17171d" />
+      <stop offset="1" stop-color="#0a0a0d" />
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.32" r="0.72">
+      <stop offset="0" stop-color="#f43f5e" stop-opacity="0.18" />
+      <stop offset="1" stop-color="#f43f5e" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="tGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fb7185" />
+      <stop offset="1" stop-color="#e11d48" />
+    </linearGradient>
+    <pattern id="checker" width="96" height="96" patternUnits="userSpaceOnUse" x="224" y="748">
+      <rect width="48" height="48" fill="#f4f4f5" />
+      <rect x="48" width="48" height="48" fill="#141418" />
+      <rect y="48" width="48" height="48" fill="#141418" />
+      <rect x="48" y="48" width="48" height="48" fill="#f4f4f5" />
+    </pattern>
+  </defs>
+
+  <rect width="1024" height="1024" fill="url(#bg)" />
+  <rect width="1024" height="1024" fill="url(#glow)" />
+
+  <!-- T monogram: horizontal bar + stem, rounded ends -->
+  <rect x="224" y="252" width="576" height="168" rx="84" fill="url(#tGrad)" />
+  <rect x="428" y="252" width="168" height="472" rx="84" fill="url(#tGrad)" />
+
+  <!-- Checkered-flag ribbon: 2 rows x 12 squares of 48px -->
+  <rect x="224" y="748" width="576" height="96" fill="url(#checker)" />
+</svg>

@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="content-security-policy"
+      content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'"
+    />
+    <title>TracingInsights Bridge</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+        font-family:
+          system-ui,
+          -apple-system,
+          'Segoe UI',
+          sans-serif;
+        background: #0b0b0f;
+        color: #e7e7ea;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      h1 {
+        margin: 0 0 4px;
+        font-size: 17px;
+        letter-spacing: 0.01em;
+      }
+      .sub {
+        margin: 0 0 16px;
+        color: #9a9aa3;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 10px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      .pill.ok {
+        background: rgba(74, 222, 128, 0.15);
+        color: #4ade80;
+        border: 1px solid rgba(74, 222, 128, 0.4);
+      }
+      .pill.warn {
+        background: rgba(250, 204, 21, 0.15);
+        color: #facc15;
+        border: 1px solid rgba(250, 204, 21, 0.4);
+      }
+      dl {
+        margin: 16px 0;
+      }
+      dt {
+        margin-top: 12px;
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #9a9aa3;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 4px;
+      }
+      code {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        padding: 6px 10px;
+        border-radius: 6px;
+        background: #17171d;
+        border: 1px solid #26262e;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+        color: #c9c9d2;
+      }
+      button {
+        padding: 6px 10px;
+        border-radius: 6px;
+        border: 1px solid #3a3a44;
+        background: #1d1d24;
+        color: #e7e7ea;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      button:hover {
+        border-color: #7c7cf0;
+        color: #b3b3ff;
+      }
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+        border-color: #3a3a44;
+        color: #e7e7ea;
+      }
+      button.primary {
+        width: 100%;
+        margin-top: 18px;
+        padding: 9px;
+        background: #7c7cf0;
+        border-color: #7c7cf0;
+        color: #0b0b0f;
+        font-weight: 600;
+      }
+      button.primary:hover {
+        filter: brightness(1.1);
+        color: #0b0b0f;
+      }
+      .hint {
+        margin: 16px 0 0;
+        color: #9a9aa3;
+      }
+      .error {
+        margin: 16px 0 0;
+        padding: 8px 12px;
+        border-radius: 6px;
+        background: rgba(248, 113, 113, 0.12);
+        border: 1px solid rgba(248, 113, 113, 0.4);
+        color: #f87171;
+      }
+      .hidden {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>TracingInsights Bridge</h1>
+    <p class="sub">Routes ChatGPT Codex &amp; Grok calls through this app.</p>
+    <span id="status" class="pill warn">Starting…</span>
+    <p id="error" class="error hidden" role="alert"></p>
+
+    <dl>
+      <dt>Bridge URL</dt>
+      <dd class="row">
+        <code id="url">—</code>
+        <button id="copy-url" type="button" disabled>Copy</button>
+      </dd>
+      <dt>Pairing token</dt>
+      <dd class="row">
+        <code id="token">—</code>
+        <button id="copy-token" type="button" disabled>Copy</button>
+      </dd>
+    </dl>
+
+    <p class="hint">
+      In the app, open Settings → AI Provider → Desktop Bridge. Paste the URL
+      and token there (or just reload — the desktop app fills them in
+      automatically). Codex and Grok requests will then go through this app's
+      localhost proxy instead of the TracingInsights server, so your ChatGPT and
+      𝕏 tokens never leave this machine.
+    </p>
+
+    <button id="reset" class="primary" type="button">
+      Reset bridge token (reconnect the web app)
+    </button>
+
+    <script src="./bridge-info-renderer.js"></script>
+  </body>
+</html>
