@@ -1,0 +1,102 @@
+/*
+ * Pet window styles. One element per sprite (#pet, and the duo's #second):
+ * the atlas is the background, `steps()` walks the row's frames (no
+ * requestAnimationFrame loop). pet.js sets the custom properties through
+ * CSSOM from each `pet:render` payload (row, frame count, duration, sizes).
+ */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.sprite {
+  position: absolute;
+  left: var(--sprite-left, 0px);
+  top: var(--sprite-top, 0px);
+  width: var(--frame-w, 144px);
+  height: var(--frame-h, 156px);
+  background-repeat: no-repeat;
+  background-size: var(--sheet-w, 1152px) var(--sheet-h, 1404px);
+  background-position: 0 calc(var(--row, 0) * var(--frame-h, 156px) * -1);
+  cursor: grab;
+  touch-action: none;
+}
+
+.sprite[hidden] {
+  display: none;
+}
+
+.sprite.dragging {
+  cursor: grabbing;
+}
+
+/* `jump-none` holds frames 0 … n−1 for equal time, so a one-shot animation
+   ends on the last real frame instead of one cell past the row. */
+.sprite.animate {
+  animation: pet-row var(--duration, 1100ms) steps(var(--frames, 6), jump-none)
+    infinite;
+}
+
+.sprite.animate.once {
+  animation-iteration-count: 1;
+  animation-fill-mode: forwards;
+}
+
+@keyframes pet-row {
+  from {
+    background-position-x: 0;
+  }
+  to {
+    background-position-x: calc(
+      (var(--frames, 6) - 1) * var(--frame-w, 144px) * -1
+    );
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sprite.animate {
+    animation: none;
+  }
+}
+
+#bubble {
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  box-sizing: border-box;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: #ffffff;
+  color: #111111;
+  border: 1px solid #d0d0d0;
+  font:
+    600 13px/1.3 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  text-align: center;
+  cursor: pointer;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+#bubble[hidden] {
+  display: none;
+}
+
+#bubble.above {
+  top: 4px;
+}
+
+#bubble.below {
+  bottom: 4px;
+}

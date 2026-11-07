@@ -1,66 +1,141 @@
 # TracingInsights Desktop (Electron)
 
-A desktop app that loads the TracingInsights web app and runs a **localhost
-bridge** so ChatGPT **Codex** and **Grok (𝕏 Premium+ / SuperGrok)** calls go
-through the user's own machine instead of the TracingInsights server.
+A desktop app that loads the TracingInsights web app and acts as the
+**inference harness** for AI provider calls. It owns custom-provider
+credentials, the Codex / Grok (xAI) device-auth tokens, the HTTP protocol
+layer, and streaming — all in the Electron **main process** — so those calls
+run through the user's own machine instead of the TracingInsights server.
 
 ## Why this exists
 
 Browsers cannot call `chatgpt.com`, `auth.x.ai`, or
-`cli-chat-proxy.grok.com` directly (no CORS headers), so today those calls are
-relayed through the TracingInsights server (`/api/codex/*`, `/api/xai/*`).
-An Electron main process has no CORS restrictions — so this app runs a tiny
-HTTP server on `127.0.0.1` that mirrors those exact routes. The web app
-detects the bridge and rewrites Codex/Grok requests to it. Your ChatGPT and 𝕏
-tokens stay on your machine; the TracingInsights server never sees them.
+`cli-chat-proxy.grok.com` directly (no CORS headers), so in a regular browser
+those calls are relayed through the TracingInsights server (`/api/codex/*`,
+`/api/xai/*`). An Electron main process has no CORS restrictions and can also
+reach the user's own local or hosted OpenAI-compatible endpoints — so the app
+runs the protocol layer itself. Your ChatGPT and 𝕏 tokens stay on your
+machine; the TracingInsights server never sees them.
+
+It also lets desktop users bring **custom providers**: a local model (Ollama /
+LM Studio / vLLM / llama.cpp on `127.0.0.1`) or a hosted OpenAI-compatible
+endpoint (Fireworks, Together, DeepInfra, …), speaking one of three wire
+protocols (`openai-completions`, `openai-responses`, `anthropic-messages`).
 
 ## How it works
 
 ```
-┌────────────────────────── Electron ──────────────────────────┐
-│ BrowserWindow  ── loads https://app.tracinginsights.com ──┐  │
-│                                                           │  │
-│   site fetch:  http://127.0.0.1:4318/api/codex/responses  │  │
-│                          │  x-bridge-token: <pairing>     │  │
-│                          ▼                                │  │
-│   bridge.mjs (node:http, bound to 127.0.0.1)              │  │
-│     ├─ /api/codex/responses  → chatgpt.com/backend-api/…  │  │
-│     ├─ /api/xai/responses    → cli-chat-proxy.grok.com/…  │  │
-│     ├─ /api/xai/oauth        → auth.x.ai (device code)    │  │
-│     └─ /api/{codex,xai}/models → static catalogs          │  │
-└──────────────────────────────────────────────────────────────┘
+┌────────────────────────────── Electron ────────────────────────────────┐
+│ BrowserWindow ── loads https://app.tracinginsights.com ──┐            │
+│                                                          │            │
+│   window.tif1aiDesktop (preload, contextIsolation+sandbox)│            │
+│     ipcRenderer.invoke('providers:*' | 'codex:*' |        │            │
+│                       'xai:*' | 'inference:*')            │            │
+│                                                          ▼            │
+│   Electron main process (src/main.mjs + modules)                      │
+│     ├─ Custom provider registry (JSON file, keys via safeStorage)     │
+│     ├─ Codex device-auth + credential store (safeStorage)             │
+│     ├─ xAI  device-auth + credential store (safeStorage)              │
+│     ├─ Protocol adapters: completions / responses / anthropic         │
+│     ├─ Codex + xAI inference adapters (native Node fetch — no CORS)   │
+│     └─ Streaming relay → webContents.send('inference:chunk', …)       │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-- The **preload** (`src/preload.cjs`) exposes `window.tif1aiDesktop`; the web
-  app's _Settings → AI Provider → Desktop Bridge_ panel auto-fills and
-  auto-connects when running inside the shell. The bridge is reachable only
-  from inside the desktop app — the site's CSP grants loopback connections to
-  desktop-app requests only (see the security section below), so there is no
-  manual pairing from a regular browser.
-- The **pairing token** is generated on first run, encrypted at rest with the
-  OS keychain (`safeStorage`; plaintext fallback with a console warning on
-  Linux without a keyring), and required on every bridge request except
-  `/health`. It is not a cookie, so no other website can use your
-  subscriptions.
-- **Reset Bridge Token** (Bridge menu / Bridge Info window) rotates the token
-  and restarts the bridge on the same port, then pushes the new state to both
-  windows over `bridge:changed`. The web app swaps the fresh token into its
-  encrypted config in place (`applyShellBridgeInfo`), so Codex/Grok calls keep
-  working and the settings panel re-pairs to _Active_ without a manual
-  disconnect + re-paste.
-- On macOS the app (and bridge) stays alive in the dock after closing the
-  window; on Windows/Linux closing the window quits and stops the bridge.
+- The **preload** (`src/preload.cjs`) exposes a narrow, typed
+  `window.tif1aiDesktop` surface; there is no generic `invoke` passthrough.
+  The web app detects the shell (`isDesktopShell()`) and drives Codex / xAI /
+  custom providers over IPC; Google / OpenRouter / Copilot keep
+  the renderer → server-proxy path.
+- **Credentials** live in the main process, stored with Electron
+  `safeStorage` (Keychain / Credential Manager / kwallet). Keys are
+  **write-only** over IPC — the page only ever sees `hasKey` / `masked`
+  signals, never the key value.
+- **Streaming** uses chunked `webContents.send('inference:chunk', …)` events
+  keyed by a caller-supplied `requestId`; `inference.abort(requestId)`
+  cancels either a stream or an in-flight `generate`. On page navigation /
+  window destruction the harness aborts every in-flight request so a
+  page-side promise can never hang.
+- On macOS the app (and harness) stays alive in the dock after closing the
+  window; on Windows/Linux closing the window quits and tears the harness
+  down — unless close-to-tray is on (see "Desktop pets & tray" below).
+
+## IPC surface (summary)
+
+See `docs/custom-providers-desktop.md` §7.2 for the full contract.
+
+- `providers.list / add / update / remove / test / listModels`
+- `codex.status / startDeviceAuth / pollDeviceAuth / connect / disconnect / listModels`
+- `xai.startDeviceAuth / pollDeviceAuth / status / disconnect / listModels`
+- `inference.generate / stream / abort`
+- `onStreamChunk(cb)` / `onStreamEnd(cb)` → `{ requestId, delta }` /
+  `{ requestId, text, usage?, finishReason?, error? }`
+
+Fallible methods resolve a discriminated `{ ok: true, … } | { ok: false,
+error }` envelope rather than rejecting, because `ipcRenderer.invoke`
+rejections drop custom error fields.
 
 ## Security model
 
-| Threat                                             | Mitigation                                                                                                                                                                                                                                                                                                                                            |
-| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Random website uses your Codex/Grok via the bridge | Bridge binds `127.0.0.1` only; every route except `/health` requires the pairing token (`x-bridge-token`, timing-safe compare). Token is not a cookie and lives in the site's encrypted local storage only.                                                                                                                                           |
-| DNS rebinding (`evil.com` → `127.0.0.1`)           | Bridge rejects any `Host` header that isn't a loopback hostname (403).                                                                                                                                                                                                                                                                                |
-| Website fingerprinting the local bridge            | Accepted trade-off: any site can probe the enumerable port range (4318–4342) and see `/health` answer — presence and bound port are inherent to a localhost agent (the prober already knows the port it connected to). The bridge version is only revealed to callers presenting a valid pairing token, so probes cannot fingerprint the exact build. |
-| Other local processes                              | Same pairing-token gate applies — only the web app with the stored token can call the bridge.                                                                                                                                                                                                                                                         |
-| Token at rest                                      | `safeStorage` (Keychain / Credential Manager / kwallet).                                                                                                                                                                                                                                                                                              |
-| Token exfiltration                                 | Never sent to the TracingInsights server; readable only by the app origin in the main window and the local Bridge Info window. OAuth provider pages and other third-party pages are denied token-bearing IPC.                                                                                                                                         |
+| Threat                               | Mitigation                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Untrusted page calls IPC             | `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`; every `ipcMain.handle` rejects senders that aren't the app-origin document in the main window (`isTrustedAppSender` in `src/ipc.mjs`).                                                                                                                                                                                         |
+| SSRF via a compromised page          | Inference sends only `providerId` / `model` / `messages` — never a raw URL. Targets come from the user's own registry; loopback hosts over `http`, remote hosts over `https` only (`src/protocols/shared.mjs` `isAllowedTarget`). The one raw-URL primitive, `providers.listModels`, is a page-supplied `GET` (discover-before-save) and uses only a page-supplied key — never a stored credential. |
+| Redirect bypass of target validation | All adapters issue `redirect: 'manual'` and re-validate every `Location` against the loopback/`https` rule before following it (native `fetch` would otherwise follow a `https → http://169.254.169.254` hop).                                                                                                                                                                                      |
+| XSS-to-persistence escalation        | Registry writes that reroute traffic (add, or update where `baseUrl`/`protocol` change) are confirmed with a native `dialog.showMessageBox` naming the target `baseUrl`; metadata-only edits apply silently. The Settings list always shows each entry's id, label, and `baseUrl`.                                                                                                                  |
+| Credential exfiltration              | Keys are write-only over IPC; stored via `safeStorage`; the page never reads them back. On Linux without a keyring (`safeStorage` unavailable / `basic_text`), keys fall back to a mode-`0600` plaintext file and the Settings UI surfaces a "keys stored unencrypted" warning — the harness never silently refuses to save.                                                                        |
+| Streaming abuse / leaks              | Requests are scoped by `requestId`, coalesced into ~30–60 ms batches, and aborted on page navigation / window destruction. Generous connect/first-token + idle-chunk timeouts cap a stalled-but-open stream.                                                                                                                                                                                        |
+
+## Desktop pets & tray
+
+Codex-style animated pets float on the desktop in their own transparent,
+always-on-top window (`src/pets/`, bundled page `src/pet/`). As-built doc:
+`docs/DESKTOP_PETS.md`; design and owner decisions:
+`docs/DESKTOP_PETS_PLAN.md`.
+
+- **No pet art ships with the app.** Users pick pets in the website gallery
+  at `/settings/pets` (shown in the main window; menu "Pets…", tray "Choose
+  pet…") or import a downloaded `.zip` / folder. Pets live in
+  `userData/pets/`; Codex pets in `~/.codex/pets` (or `$CODEX_HOME/pets`)
+  are listed read-only. Tests use generated atlases only.
+- **Only the main process talks to Petdex** (`petdex.dev` /
+  `assets.petdex.dev`, allowlisted), and only while the gallery asks. Every
+  pet — Petdex, Codex folder or import — passes `src/pets/pet-validate.mjs`
+  first. The pet window loads only bundled files and `pet-asset://` sprites.
+- **Reactions**: chat activity from the page (`pets.signal`), the F1
+  calendar from `https://app.tracinginsights.com/desktop/schedule.json`
+  (fetched on launch and every 24 h, cached in `userData`) as speech bubbles
+  only — never OS notifications. "During sessions" = Calm (default) /
+  Lively / Off; Quiet for 1 h or until the session ends from the pet's
+  right-click menu or the tray.
+- **Tray**: closing the window destroys it and the app keeps running in the
+  tray (setting "Closing the window quits the app" opts out); reopen from
+  the tray, by double-clicking the pet or by launching the app again.
+  Launch at login is opt-in.
+- **Linux**: with pets on in a Wayland session, the app relaunches itself
+  once with `--ozone-platform=x11` in argv (XWayland) so the pet can stay on
+  top and position itself — `app.commandLine.appendSwitch` is too late in
+  Electron 38+ (no windows are drawn). Without XWayland (`DISPLAY` unset)
+  there is no floating pet. The tray needs a
+  StatusNotifier host (GNOME: the AppIndicator extension).
+- **Native pet** (`docs/DESKTOP_PETS_NATIVE_PLAN.md`): when the installer
+  carries `resources/ti-pet/ti-pet-<platform>-<arch>` (built by the
+  `TracingInsights/petdex` fork, pinned in `native-pet.json`), that small
+  program draws the pet and owns the tray. Closing the window compiles the
+  next 7 days into `userData/pet-timeline.json`, hands it over on
+  `userData/pet.sock` (token in `userData/pet-token`, both 0600) and **quits
+  Electron**; the pet starts the app again with `--pets-open=<path>`,
+  `--pets-refresh` (windowless recompile, < 1 s measured) or
+  `--pets-install-update`. Quit from either side quits both. No binary, or
+  one that cannot start → the Electron pet window above (`pets.status()`
+  `renderer` / `rendererReason`; a failed start is remembered in
+  `userData/pet-native-failure.json` so the next start relaunches under
+  XWayland and the fallback pet can show). Dev:
+  `TIF1AI_NATIVE_PET=<path to a ti-pet build or a wrapper>`,
+  `TIF1AI_PETS_RENDERER=electron` forces the fallback; the protocol stub
+  `src/pets/test-fixtures/native-pet-stub.mjs` stands in for the binary in
+  tests.
+- Settings: `userData/pets-settings.json` (pets off until a pet is picked).
+  Tests: `bun test src/pets/`.
 
 ## Development
 
@@ -71,33 +146,31 @@ bun run start          # launches against https://app.tracinginsights.com
 
 # point at a local dev server instead:
 TIF1AI_APP_URL=http://127.0.0.1:5173 bun run start
-
-# change the bridge port — must stay inside the CSP-allowlisted
-# 4318–4342 range (the web app only grants loopback connections to these
-# ports, so an out-of-range override would be unreachable):
-TIF1AI_BRIDGE_PORT=4325 bun run start
 ```
 
-`bun run start` prints `[bridge] listening on http://127.0.0.1:<port>`.
+Timeout tuning (Ollama cold model loads can take minutes):
 
-**End-to-end verification** (requires the dev server on 5173 and Electron
-launched with `--remote-debugging-port=9222`):
+- `TIF1AI_MODEL_LOAD_GRACE_MS` — connect/first-token timeout (default 600 s).
+- `TIF1AI_STREAM_IDLE_TIMEOUT_MS` — idle watchdog: no bytes since the last
+  chunk (default 300 s).
+
+### Tests
 
 ```bash
-bun run e2e   # from desktop/; drives the Electron window via CDP and checks
-              # auto-connect, localhost routing, and live forwards
+bun test                # unit tests for adapters, registry, IPC, inference
+bun run smoke           # add → discover → stream → abort against a mock server
+bun run e2e             # CDP e2e (requires the dev server on 5173 + Electron
+                        # with --remote-debugging-port=9222)
 ```
 
-Headless environments: `xvfb-run -a bun run start -- --no-sandbox
---disable-gpu --remote-debugging-port=9222`.
+Headless e2e: `xvfb-run -a bun run start -- --no-sandbox --disable-gpu
+--remote-debugging-port=9222`.
 
-Test the bridge without launching Electron:
-
-```bash
-bun -e "import { createBridgeServer, DEFAULT_PORT } from './src/bridge.mjs'; const s = createBridgeServer({ token: 'demo-token-1234567890' }); s.listen(DEFAULT_PORT, '127.0.0.1', () => console.log('up'));"
-curl http://127.0.0.1:4318/health
-curl -H 'x-bridge-token: demo-token-1234567890' http://127.0.0.1:4318/api/codex/models
-```
+The golden-trace fixtures in `src/protocols/__fixtures__/` are shared **data**
+consumed by both the desktop `bun test` suite and the website's Vitest suite,
+so SSE parsing and device-auth refresh logic are exercised against the same
+recordings (shared data, not shared code — the SSE parsers are necessarily
+duplicated between the TS website and the `.mjs` main process).
 
 ## Packaging
 
@@ -110,6 +183,20 @@ bun run dist:win         # nsis installer
 bun run dist:linux       # AppImage + deb
 bun run publish:release  # ship a release via the public mirror repo (see below)
 ```
+
+**Native pet.** `bun run scripts/fetch-native-pet.mjs --write` downloads the
+`ti-pet` binaries pinned in `native-pet.json` and verifies their SHA-256
+into `resources/ti-pet/` (`--target darwin` = both macOS arches, `--from
+<dir>` = local files, `--require` = fail while unpinned). The release
+workflow runs it before electron-builder; with the pin unset the installer
+ships without it (Electron pet). `resources/ti-pet/` also holds the committed
+license texts (`THIRD-PARTY-NOTICES.md`, Petdex MIT, Native SDK Apache-2.0),
+which `extraResources` always packs; the script refuses to write a binary
+without them. A new renderer: tag `ti-pet-vX.Y.Z` on the fork
+(`.github/workflows/ti-pet-release.yml` builds linux-x64, win32-x64,
+darwin-arm64, darwin-x64 + `SHA256SUMS`, never marked latest) → copy tag and
+hashes into `native-pet.json` → desktop release. The `.deb` depends on
+`libgtk-4-1` + `webp-pixbuf-loader`.
 
 **Icons.** `build/icon.png` (1024×1024), `build/icon.icns`, and
 `build/icon.ico` are generated from `assets/icon.png` (the TracingInsights
@@ -168,22 +255,16 @@ gh repo create TracingInsights/desktop --public \
 - `…/releases/latest/download/TracingInsights-win.exe`
 - `…/releases/latest/download/TracingInsights-linux.AppImage`
 
-The site's Settings → AI Provider → Desktop Bridge panel links these for
-non-desktop visitors (`DESKTOP_DOWNLOAD_LINKS` in
-`src/lib/ai/desktop-bridge.ts` — keep it in sync with `artifactName`).
+The site's Settings links these for non-desktop visitors
+(`DESKTOP_DOWNLOAD_LINKS` in `src/lib/ai/desktop-bridge.ts` — keep it in sync
+with `artifactName`).
 
-The app checks for updates ~10 s after launch and via _Bridge → Check for
-Updates…_. Downloads are user-confirmed; once downloaded, the new version
-installs on quit or immediately via "Restart Now". Dev runs (`bun run start`)
-never check — only packaged builds do.
-
-**Deploy order matters.** The site's CSP only grants loopback `connect-src`
-to requests carrying the `x-tif1ai-desktop-shell` marker header (set by this
-app's `webRequest` hook). The web deploy that tightened the CSP (removed the
-old `http://127.0.0.1:*` wildcard) must land together with — or before — a
-desktop release that sends the header (already the case in production).
-Installed desktop apps that predate the header would be served the
-restrictive CSP and lose bridge connectivity until they auto-update.
+The app checks for updates ~10 s after launch, every 6 hours while it runs
+(closing the window keeps it in the tray, so it can run for days) and via
+_TracingInsights → Check for Updates…_. Updates download in the background
+(0.2.0+); when one is ready a notification, the tray menu and the app menu
+offer "Restart to update", and otherwise it installs on quit. Dev runs
+(`bun run start`) never check — only packaged builds do.
 
 ### Signing requirements
 
@@ -215,46 +296,31 @@ drifted (same contract as the stats manifest checks).
   workflow template `release-template/desktop-release.yml` becomes that
   repo's build-and-publish workflow. Download URLs for the site live in
   `src/lib/ai/desktop-bridge.ts` (`DESKTOP_DOWNLOAD_LINKS`).
-- Web-side bridge client: `src/lib/ai/desktop-bridge.ts` (primitives:
-  config, health, URL rewriting) and `src/lib/ai/bridge-sync.ts` (singleton
-  shell-push sync + event bus for UI updates)
-- Proxy URL consumers rewired through the bridge: `src/lib/ai/run/clients/codex-client.ts`,
-  `src/lib/ai/run/clients/xai-oauth-client.ts`, `src/lib/ai/xai/device-auth.ts`,
-  `src/lib/ai/providers/codex.client.ts`, `src/lib/ai/providers/xai-oauth.client.ts`
-- Settings UI: `src/lib/components/provider-settings/DesktopBridgePanel.svelte`
-  (rendered by `ProviderSettings.svelte`)
-- CSP loopback allowance: `DESKTOP_BRIDGE_ORIGINS` in
-  `src/lib/server/hooks/handlers/security-headers.ts` — enumerated 4318–4342
-  ports, emitted only for requests carrying the desktop-shell marker header
-  (`x-tif1ai-desktop-shell`, set by this app's `webRequest` hook); unit tests
-  keep both sides in sync
+- Harness client: `src/lib/ai/desktop-harness.ts` (typed IPC helpers +
+  `isDesktopShell`); `src/lib/ai/desktop-bridge.ts` keeps only the download
+  links + shell detection.
+- Desktop branches in the run layer: `src/lib/ai/run/browser-adapter.ts`
+  (plan / repair / answer), `src/lib/ai/run/clients/codex-client.ts`,
+  `src/lib/ai/run/clients/xai-oauth-client.ts`.
+- Settings UI: `src/lib/components/provider-settings/CustomProvidersPanel.svelte`
+  - the desktop branches in `CodexAuthPanel.svelte` / `XaiAuthPanel.svelte`
+    (rendered by `ProviderSettings.svelte`); the dropdown merge is in
+    `ChatProviderBar.svelte`.
 - Static model catalogs: `desktop/src/model-catalogs.mjs` is the shared source used by
-  both the bridge and the site routes under
-  `src/routes/api/{codex,xai}/models/+server.ts`
-- App icons: `assets/icon.png` (logo source) → generated `build/icon.*`
+  the harness and the site routes under
+  `src/routes/api/{codex,xai}/models/+server.ts`.
+- App icons: `assets/icon.png` (logo source) → generated `build/icon.*`.
 
 ## Known limitations
 
 - **macOS auto-update requires a signed + notarized app.** Until Developer ID
   signing is configured, macOS users get new releases from the GitHub
   Releases page, not in-app updates.
-- The app stores the bridge pairing token, not your Codex/Grok credentials —
-  those live in the site's encrypted local storage (IndexedDB) and are never
-  touched by the desktop app or the server.
-- Safari blocks mixed content (`https` page → `http://127.0.0.1`) — bridge
-  auto-connect only works in Chromium/Firefox or inside this Electron app.
-- The site's encrypted bridge config uses the same key-crypto scheme as API
-  keys. In session-only mode the encryption seed lives only in memory, so
-  when the tab closes the stored value becomes undecryptable rather than
-  being physically cleared from localStorage.
-- Closing the app window on Windows/Linux stops the bridge (macOS keeps it
+- Codex/xAI credentials are stored in `safeStorage`; on Linux without a
+  keyring they fall back to a mode-`0600` plaintext file (surfaced in the UI).
+- Custom providers are gated to the desktop shell; a regular browser never
+  sees them. Remote custom endpoints must be `https`; plain-`http` LAN hosts
+  (e.g. Ollama on `http://192.168.x.x:11434`) are excluded by design — run
+  them locally or front them with `https`.
+- Closing the app window on Windows/Linux quits the harness (macOS keeps it
   alive in the dock).
-- The site's CSP only grants loopback `connect-src` to requests carrying the
-  desktop-shell marker header, and only for the enumerated 4318–4342 ports
-  (`DESKTOP_BRIDGE_ORIGINS` in `src/lib/server/hooks/handlers/security-headers.ts`).
-  Regular browsers never receive loopback `connect-src`, so manual bridge
-  pairing from a regular browser is not possible — the bridge is a
-  desktop-app-only feature. Residual risk (bounded, not eliminated): inside
-  the desktop app, an XSS could reach a local service bound to one of the
-  4318–4342 ports. See the comment on `DESKTOP_BRIDGE_ORIGINS` for the full
-  rationale.

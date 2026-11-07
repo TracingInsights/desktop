@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Bundled pet page (docs/DESKTOP_PETS_PLAN.md §4.4): no remote content, ever. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src pet-asset:; style-src 'self'; script-src 'self'"
+    />
+    <title>TracingInsights pet</title>
+    <link rel="stylesheet" href="pet.css" />
+    <script src="pet.js" defer></script>
+  </head>
+  <body>
+    <div id="bubble" role="status" aria-live="polite" hidden></div>
+    <div
+      id="second"
+      class="sprite"
+      role="img"
+      aria-label="Second desktop pet"
+      hidden
+    ></div>
+    <div id="pet" class="sprite" role="img" aria-label="Desktop pet"></div>
+  </body>
+</html>

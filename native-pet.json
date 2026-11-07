@@ -1,0 +1,23 @@
+{
+  "$comment": "Native pet pin (docs/DESKTOP_PETS_NATIVE_PLAN.md N5). The TracingInsights/petdex fork's CI publishes ti-pet binaries on a ti-pet-v* tag; set `tag` and every sha256 (lowercase hex of the release asset) together. While `tag` is null the installers ship without a native pet and the Electron pet runs (fallback, N3). scripts/fetch-native-pet.mjs downloads + verifies into resources/ti-pet/.",
+  "repo": "TracingInsights/petdex",
+  "tag": "ti-pet-v0.1.1",
+  "files": {
+    "linux-x64": {
+      "asset": "ti-pet-linux-x64",
+      "sha256": "9ac440a8b2d437c4982b388ad64cb00d822842a13ac095e5fbd9a719735ef1b4"
+    },
+    "win32-x64": {
+      "asset": "ti-pet-win32-x64.exe",
+      "sha256": "dc9068171af4027c7f0be023e07ba5742bc1697fe7db4adb846a17c8bf026854"
+    },
+    "darwin-arm64": {
+      "asset": "ti-pet-darwin-arm64",
+      "sha256": "ca23e7965d23fd58f94b011a757107a30793c9a9dc3e096bd9965c5cdafae071"
+    },
+    "darwin-x64": {
+      "asset": "ti-pet-darwin-x64",
+      "sha256": "28be7e082436cddcc3c85bc437745b78a29424b45a8801cc6f1499b3cb317192"
+    }
+  }
+}

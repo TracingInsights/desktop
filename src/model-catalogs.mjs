@@ -1,7 +1,7 @@
 /**
- * Static model catalogs shared by the desktop bridge and SvelteKit proxies.
+ * Static model catalogs shared by the desktop harness and SvelteKit proxies.
  *
- * This dependency-free module lives beside the bridge so Electron's default
+ * This dependency-free module lives beside the harness so Electron's default
  * packaging includes it. The SvelteKit routes import the same source at build
  * time, preventing the desktop and web catalogs from drifting apart.
  */
@@ -17,6 +17,11 @@
 // window is not yet published; 256000 is used as a conservative placeholder.
 // It may only be selectable for accounts with preview access. The sol/terra/luna
 // sub-variants were confirmed via the user's partner portal.
+// Verified 2026-08-14 (https://learn.chatgpt.com/docs/models): the recommended
+// ChatGPT-sign-in set is gpt-5.6-sol / -terra / -luna, gpt-5.3-codex-spark,
+// and gpt-5.5. gpt-5.4 and gpt-5.4-mini retire from Codex on 2026-08-31
+// (migrate to gpt-5.6-terra / gpt-5.6-luna); gpt-5.2 and gpt-5.3-codex are
+// already deprecated for ChatGPT sign-in.
 export const STATIC_CODEX_MODELS = [
   { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', contextWindow: 256000 },
   { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', contextWindow: 256000 },
@@ -32,6 +37,11 @@ export const STATIC_CODEX_MODELS = [
 ];
 
 export const STATIC_XAI_MODELS = [
+  // Verified 2026-08-14: grok-4.6 is the current SuperGrok/xAI flagship via
+  // the OAuth cli-chat-proxy.grok.com path (500K context). Keep the older
+  // entries below — entitled accounts may still serve them — but grok-4.6 is
+  // the model new users should reach for.
+  { id: 'grok-4.6', name: 'Grok 4.6', contextWindow: 500000 },
   { id: 'grok-build-0.1', name: 'Grok Build 0.1', contextWindow: 256000 },
   { id: 'grok-4.5', name: 'Grok 4.5', contextWindow: 256000 },
   { id: 'grok-4.3', name: 'Grok 4.3', contextWindow: 256000 },

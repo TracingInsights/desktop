@@ -1,64 +1,95 @@
 /**
- * TracingInsights Desktop — Electron browser shell + localhost bridge.
+ * TracingInsights Desktop — Electron shell + inference harness.
  *
  * The main window loads the production web app (https://app.tracinginsights.com).
- * In the background, a local HTTP bridge (desktop/src/bridge.mjs) mirrors the
- * site's /api/codex/* and /api/xai/* proxy routes so ChatGPT Codex and Grok
- * (SuperGrok) calls run through the user's own machine instead of the
- * TracingInsights server. The preload (preload.cjs) exposes `window.tif1aiDesktop`
- * so the site can auto-connect to the bridge (URL + pairing token) with zero
- * copy-paste.
+ * The Electron main process is the inference harness: it owns custom-provider
+ * credentials (safeStorage), the Codex/xAI device-auth + credential stores,
+ * the protocol adapters (anthropic-messages / openai-completions /
+ * openai-responses), and streaming. The website keeps product orchestration
+ * (prompts, SQL planning, DuckDB, resilience) and drives inference through the
+ * typed `window.tif1aiDesktop` surface (preload.cjs).
  *
- * The pairing token is generated on first run, encrypted at rest with the OS
- * keychain via safeStorage (fallback: plaintext file + console warning), and
- * shown in the Bridge menu / Bridge Info window. The token never leaves the
- * machine and is not a cookie, so other websites cannot use the bridge.
+ * There is no localhost HTTP bridge and no pairing token — the old
+ * desktop/src/bridge.mjs was removed with this change (see
+ * docs/custom-providers-desktop.md).
+ *
+ * Desktop pets (docs/DESKTOP_PETS_PLAN.md) live in ./pets/: a floating pet
+ * window, tray, close-to-tray lifecycle, the quick-ask window and the
+ * `pets:*` IPC, assembled by pets/runtime.mjs once the app is ready. The
+ * quick-ask window loads the app with this preload, so the harness trusts it
+ * like the main window.
+ *
+ * Native pet (docs/DESKTOP_PETS_NATIVE_PLAN.md): a bundled `ti-pet` binary
+ * (resources/ti-pet/) draws the pet and owns the tray; closing the window
+ * hands the pet over and quits. The pet starts the app again with
+ * `--pets-refresh` (windowless timeline recompile), `--pets-open=<path>`
+ * (Open / Choose pet… / bubble clicks) or `--pets-install-update`.
  */
 import {
   app,
   BrowserWindow,
   Menu,
+  Notification,
+  Tray,
   clipboard,
   dialog,
   ipcMain,
+  nativeImage,
+  powerMonitor,
+  protocol,
   safeStorage,
+  screen,
   session,
-  shell
+  shell,
+  systemPreferences
 } from 'electron';
-import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import * as nodeFs from 'node:fs';
+import { existsSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { createProviderRegistry } from './provider-registry.mjs';
+import { createCredentialStore } from './credential-store.mjs';
+import { createCodexAuth } from './codex-auth.mjs';
+import { createXaiAuth } from './xai-auth.mjs';
+import { createCodexInference } from './codex-inference.mjs';
+import { createXaiInference } from './xai-inference.mjs';
+import { createInference } from './inference.mjs';
+import { createHarnessIpc, isTrustedAppSender } from './ipc.mjs';
+import { listModels } from './model-discovery.mjs';
 import {
-  createBridgeServer,
-  listenBridgeServer,
-  DEFAULT_PORT,
-  BRIDGE_PORT_ATTEMPTS,
-  BRIDGE_VERSION,
-  TOKEN_MIN_LENGTH
-} from './bridge.mjs';
-// electron-updater is CommonJS; Electron's ESM loader cannot resolve its
-// named export statically (SyntaxError at startup), so import the module
-// object and destructure instead.
+  MODEL_LOAD_GRACE_MS,
+  STREAM_IDLE_TIMEOUT_MS
+} from './protocols/shared.mjs';
+import { readSettingsSync } from './pets/settings.mjs';
+import { PET_PRIVILEGED_SCHEMES } from './pets/protocols.mjs';
+import { relaunchUnderXWaylandIfNeeded } from './pets/linux.mjs';
+import { appLaunchArgs } from './pets/lifecycle.mjs';
+import { createPetsRuntime } from './pets/runtime.mjs';
+import { lastNativeStartFailed } from './pets/pet-renderer.mjs';
+import {
+  INSTALL_UPDATE_ARG,
+  nativeBinaryName,
+  parsePetsOpenArg,
+  REFRESH_ARG
+} from './pets/native-protocol.mjs';
+import { ASK_PATH } from './pets/contract.mjs';
+import { createNotifier } from './pets/notify.mjs';
+import { attachZoomKeys } from './zoom-keys.mjs';
 import updaterPkg from 'electron-updater';
 const { autoUpdater } = updaterPkg;
 
+// Deliberately kept in sync with the `harnessVersion` string exposed by
+// preload.cjs (sandboxed preloads cannot read local files). Bump both when the
+// harness surface changes. The web app keys the legacy-credential migration
+// decision (docs/custom-providers-desktop.md §8/OQ1) off this value.
+export const HARNESS_VERSION = '1.1.0';
+
 // Delay the first update check so it never competes with app startup.
 const UPDATE_CHECK_STARTUP_DELAY_MS = 10_000;
-
-// Loopback connect-src is only granted to requests carrying this marker
-// header, and only for the ports the bridge may bind (DEFAULT_PORT ..
-// DEFAULT_PORT + BRIDGE_PORT_ATTEMPTS - 1 = 4318–4342). The web app sets
-// the same contract in src/lib/server/hooks/handlers/security-headers.ts
-// (DESKTOP_SHELL_HEADER + DESKTOP_BRIDGE_ORIGINS). MUST stay identical —
-// tests/unit/security-headers.test.ts greps this file to keep the two in
-// sync. Regular browsers never set this header, so they never receive
-// loopback connect-src from the server.
-const DESKTOP_SHELL_HEADER = 'x-tif1ai-desktop-shell';
-const DESKTOP_BRIDGE_MIN_PORT = DEFAULT_PORT;
-// The last port the CSP allowlist covers. Kept as a single derived constant
-// so the retry walk and the env override can never escape the allowlist.
-const DESKTOP_BRIDGE_MAX_PORT = DEFAULT_PORT + BRIDGE_PORT_ATTEMPTS - 1;
+// Closing the window keeps the app in the tray, so it can run for days:
+// check again periodically, not only at launch.
+const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -66,206 +97,97 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // TIF1AI_APP_URL=http://127.0.0.1:5173.
 const APP_URL = process.env.TIF1AI_APP_URL || 'https://app.tracinginsights.com';
 const APP_ORIGIN = new URL(APP_URL).origin;
-const BRIDGE_INFO_FILE = join(__dirname, 'bridge-info.html');
-const BRIDGE_INFO_URL = pathToFileURL(BRIDGE_INFO_FILE).href;
-const CONFIG_FILE = 'bridge-config.json';
 
 let mainWindow = null;
-let bridgeInfoWindow = null;
-let bridgeServer = null;
-let bridgeToken = null;
-let bridgePort = null;
+/** Desktop pets runtime (built after `ready`). */
+let pets = null;
 
 // ---------------------------------------------------------------------------
-// Bridge token persistence (safeStorage-encrypted in userData)
+// Harness wiring
 // ---------------------------------------------------------------------------
 
-function configPath() {
-  return join(app.getPath('userData'), CONFIG_FILE);
-}
-
-function persistToken(token) {
-  const file = configPath();
-  const encrypted = safeStorage.isEncryptionAvailable();
-  const payload = encrypted
-    ? {
-        token: safeStorage.encryptString(token).toString('base64'),
-        encrypted: true
-      }
-    : { token, encrypted: false };
-  try {
-    mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify(payload, null, 2), { mode: 0o600 });
-  } catch (error) {
-    console.warn('[bridge] could not persist bridge token:', error);
-  }
-  return encrypted;
-}
-
-function loadOrCreateToken() {
-  const file = configPath();
-  let stored = null;
-  try {
-    if (existsSync(file)) stored = JSON.parse(readFileSync(file, 'utf8'));
-  } catch {
-    // Corrupt config — regenerate below.
-  }
-  if (
-    stored &&
-    typeof stored.token === 'string' &&
-    stored.token.length >= TOKEN_MIN_LENGTH
-  ) {
-    if (stored.encrypted && safeStorage.isEncryptionAvailable()) {
-      try {
-        return safeStorage.decryptString(Buffer.from(stored.token, 'base64'));
-      } catch {
-        // Fall through to regeneration.
-      }
-    } else if (!stored.encrypted) {
-      return stored.token;
-    }
-  }
-  const token = randomBytes(32).toString('base64url');
-  if (!persistToken(token)) {
-    // safeStorage may be unavailable (e.g. no keyring backend on some Linux
-    // setups); the plaintext fallback already happened inside persistToken.
-    const hint =
-      process.platform === 'linux'
-        ? ' Consider setting a keyring (gnome-keyring/kwallet).'
-        : '';
-    console.warn(
-      `[bridge] OS keychain unavailable — bridge token stored without encryption on disk.${hint}`
-    );
-  }
-  return token;
-}
-
-// ---------------------------------------------------------------------------
-// Bridge server lifecycle
-// ---------------------------------------------------------------------------
-
-function bridgeUrl() {
-  // Gate on the live server handle, not just the port: `bridgePort` keeps
-  // its last value after stopBridge()/stopBridgeAsync(), so a failed start
-  // or a failed token-reset restart would otherwise emit an invalid
-  // `http://127.0.0.1:null`. When the bridge is down there is no URL to
-  // show or copy.
-  if (!bridgeServer || typeof bridgePort !== 'number') return null;
-  return `http://127.0.0.1:${bridgePort}`;
-}
-
-async function startBridge() {
-  if (bridgeServer) return;
-  bridgeToken = loadOrCreateToken();
-  const envPort = Number.parseInt(process.env.TIF1AI_BRIDGE_PORT ?? '', 10);
-  // The site's CSP allowlists exactly the ports the bridge may bind
-  // (4318–4342, see DESKTOP_BRIDGE_ORIGINS). A port outside that range would
-  // be unreachable from the web app (CSP blocks the fetch), so an env
-  // override is clamped into the range instead of honoured blindly.
-  let requested = DEFAULT_PORT;
-  if (Number.isFinite(envPort) && envPort > 0) {
-    if (
-      envPort >= DESKTOP_BRIDGE_MIN_PORT &&
-      envPort <= DESKTOP_BRIDGE_MAX_PORT
-    ) {
-      requested = envPort;
-    } else {
-      console.warn(
-        `[bridge] TIF1AI_BRIDGE_PORT ${envPort} is outside the CSP-allowlisted ` +
-          `range ${DESKTOP_BRIDGE_MIN_PORT}–${DESKTOP_BRIDGE_MAX_PORT}; using ${DEFAULT_PORT}.`
-      );
-    }
-  }
-  // The retry walk lives in bridge.mjs (listenBridgeServer) so it is unit
-  // testable without Electron. The walk stays within the CSP-allowlisted
-  // range because `requested` was clamped above and `maxPort` is the
-  // allowlist ceiling. /health reports the actual bound port from the
-  // accepted connection's socket, so a walk to a later port never leaves the
-  // health endpoint lying about which port the bridge is on.
-  const server = createBridgeServer({ token: bridgeToken });
-  const port = await listenBridgeServer(server, {
-    requestedPort: requested,
-    maxPort: DESKTOP_BRIDGE_MAX_PORT
-  });
-  bridgeServer = server;
-  bridgePort = port;
-  // The retry loop's per-attempt error listener is gone by now, so a fatal
-  // server error after binding would otherwise be an unhandled 'error' that
-  // crashes the whole app. Log instead.
-  server.on('error', (error) =>
-    console.error('[bridge] bridge server error:', error)
-  );
-  console.log(
-    `[bridge] listening on ${bridgeUrl()} (token stored in userData)`
-  );
-}
-
-function stopBridge() {
-  if (bridgeServer) {
-    bridgeServer.close();
-    bridgeServer = null;
-  }
-}
-
-/** Close the bridge and wait for the listening socket to be released. */
-function stopBridgeAsync() {
-  if (!bridgeServer) return Promise.resolve();
-  const server = bridgeServer;
-  bridgeServer = null;
-  server.closeAllConnections?.();
-  return new Promise((resolve) => server.close(() => resolve()));
-}
-
-function bridgeInfo() {
-  const running = Boolean(bridgeServer);
-  return {
-    // null when the bridge never bound a port (startBridge failed) or was
-    // taken down — never a bogus `http://127.0.0.1:null`.
-    url: running ? bridgeUrl() : null,
-    token: bridgeToken,
-    // The port only exists while the bridge is live; after a failed
-    // restart `bridgePort` keeps its last value, which must not leak as
-    // if the bridge were listening.
-    port: running ? bridgePort : null,
-    running,
-    version: app.getVersion() || BRIDGE_VERSION
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Desktop-shell marker header
-// ---------------------------------------------------------------------------
+let harness = null;
 
 /**
- * Tag every request to the app origin with the desktop-shell marker header
- * so the server knows to include the loopback bridge ports in this window's
- * CSP (see `DESKTOP_BRIDGE_ORIGINS` in
- * src/lib/server/hooks/handlers/security-headers.ts). Without the marker the
- * page served inside Electron would carry the same restrictive CSP as a
- * regular browser and the bridge fetch would be blocked before it started.
- * The header is only added to app-origin requests — third-party calls
- * (analytics, OAuth, provider APIs) stay untouched.
- *
- * DEPLOY ORDER: the web app and this desktop app ship independently. The
- * server only grants loopback connect-src to requests carrying this header,
- * so the web deploy that removes the old `:*` wildcard must land together
- * with (or before) a desktop release that sets it — otherwise already-
- * installed desktop apps (no header) get the restrictive CSP and lose bridge
- * connectivity until they auto-update.
+ * Build the harness (registry, credential stores, auth + inference adapters,
+ * IPC). Constructed once `app` is ready (safeStorage is unusable before then).
  */
-function setupDesktopShellHeader() {
-  session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
-    // Origin comparison, not string prefix: `app.tracinginsights.com` must
-    // not match lookalike hosts like `app.tracinginsights.com.evil.com`.
-    try {
-      if (new URL(details.url).origin === APP_ORIGIN) {
-        details.requestHeaders[DESKTOP_SHELL_HEADER] = '1';
-      }
-    } catch {
-      // Unparseable URL — never tag.
-    }
-    callback({ requestHeaders: details.requestHeaders });
+function buildHarness() {
+  const userDataDir = app.getPath('userData');
+
+  const registry = createProviderRegistry({
+    userDataDir,
+    safeStorage,
+    // Native confirmation on any write that reroutes traffic (add, or
+    // baseUrl/protocol change). Metadata-only edits apply silently.
+    confirm: (baseUrl) =>
+      dialog
+        .showMessageBox(mainWindow ?? undefined, {
+          type: 'warning',
+          buttons: ['Route traffic', 'Cancel'],
+          defaultId: 1,
+          cancelId: 1,
+          title: 'Route chat traffic',
+          message: `Route chat traffic to ${baseUrl}?`,
+          detail:
+            'Prompts, SQL, and results for this provider will be sent to this endpoint.'
+        })
+        .then(({ response }) => response === 0)
+        .catch(() => false)
   });
+
+  const credentialStore = createCredentialStore({ userDataDir, safeStorage });
+  const codexAuth = createCodexAuth({ credentialStore });
+  const xaiAuth = createXaiAuth({ credentialStore });
+
+  const codexInference = createCodexInference({
+    codexAuth,
+    idleTimeoutMs: STREAM_IDLE_TIMEOUT_MS,
+    firstTokenTimeoutMs: MODEL_LOAD_GRACE_MS
+  });
+  const xaiInference = createXaiInference({
+    xaiAuth,
+    idleTimeoutMs: STREAM_IDLE_TIMEOUT_MS,
+    firstTokenTimeoutMs: MODEL_LOAD_GRACE_MS
+  });
+
+  const inference = createInference({
+    registry,
+    codexInference,
+    xaiInference,
+    idleTimeoutMs: STREAM_IDLE_TIMEOUT_MS,
+    firstTokenTimeoutMs: MODEL_LOAD_GRACE_MS
+  });
+
+  const ipc = createHarnessIpc({
+    ipcMain,
+    isTrustedSender: (event) =>
+      isTrustedAppSender(event, {
+        mainWindow,
+        windows: [pets?.askWindow() ?? null],
+        appOrigin: APP_ORIGIN
+      }),
+    registry,
+    codex: codexAuth,
+    xai: xaiAuth,
+    inference,
+    listModels
+  });
+  ipc.register();
+
+  return { registry, codexAuth, xaiAuth, inference, ipc };
+}
+
+/**
+ * Abort a window's in-flight inference on navigation and on destruction so
+ * a page-side stream promise can never hang after a reload (§7.5) — only
+ * that window's requests (the quick-ask window streams alongside).
+ */
+function abortInferenceWith(webContents) {
+  const abort = () => harness?.ipc.abortSender(webContents);
+  webContents.on('did-navigate', abort);
+  webContents.on('did-navigate-in-page', abort);
+  webContents.on('destroyed', abort);
 }
 
 // ---------------------------------------------------------------------------
@@ -304,29 +226,15 @@ function openExternalHttps(url) {
   }
 }
 
-function isBridgeInfoUrl(url) {
-  try {
-    return new URL(url).href === BRIDGE_INFO_URL;
-  } catch {
-    return false;
-  }
+/** Pet-store links (Petdex, codex-pet.org, …) open in the in-app store window. */
+function openOutside(url) {
+  if (pets?.isPetStoreUrl(url)) pets.openStore(url);
+  else openExternalHttps(url);
 }
 
-// OAuth provider origins the shell may navigate to *in-app*. Better Auth
-// social sign-in (/login → /api/auth/sign-in/{github,google}) 302-redirects
-// the top-level page to the provider; if that redirect were externalized
-// like every other off-origin navigation, the OAuth flow would complete in
-// the system browser and the session cookie would never land in the
-// Electron session — sign-in would silently dead-end. Allowing these
-// origins lets the flow run inside the shell; the provider's callback
-// returns to the app origin (allowed by sameAppOrigin), which sets the
-// session cookie in the Electron session. MUST stay in sync with the
-// providers configured in createSocialProviders()
-// (src/lib/server/auth/auth.ts). Both providers keep their whole
-// authorize/login/consent flow on a single origin, so an origin-level
-// allowlist suffices. Device-auth flows (Codex/xAI) are unaffected: they
-// open with target="_blank" and are externalized by setWindowOpenHandler
-// below, by design.
+// OAuth provider origins the shell may navigate to *in-app* (Better Auth
+// social sign-in). MUST stay in sync with createSocialProviders() in
+// src/lib/server/auth/auth.ts.
 const OAUTH_PROVIDER_ORIGINS = new Set([
   'https://github.com',
   'https://accounts.google.com'
@@ -340,9 +248,8 @@ function isOAuthProviderOrigin(url) {
   }
 }
 
-function createWindow() {
-  // Dev/unpacked runs on Windows/Linux use the generated icon; packaged apps
-  // get their icon from the exe/dmg bundle instead (build/ is not shipped).
+/** @param {string} [path] app path to open instead of `/` (e.g. '/settings/pets') */
+function createWindow(path) {
   const devIconPath = join(__dirname, '..', 'build', 'icon.png');
   const windowIcon =
     process.platform !== 'darwin' && existsSync(devIconPath)
@@ -361,218 +268,95 @@ function createWindow() {
     ...windowIcon
   });
 
-  mainWindow.loadURL(APP_URL);
+  // Only app-origin paths: the main window is the trusted IPC sender.
+  const target = path ? new URL(path, APP_URL) : null;
+  mainWindow.loadURL(
+    target && target.origin === APP_ORIGIN ? target.href : APP_URL
+  );
 
-  // Open external links (device-auth pages, provider docs) in the system
-  // browser so the user's normal sessions are used; same-origin new windows
-  // stay in-app.
+  attachZoomKeys(mainWindow.webContents);
+
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (sameAppOrigin(url)) {
       return { action: 'allow' };
     }
-    openExternalHttps(url);
+    openOutside(url);
     return { action: 'deny' };
   });
 
-  // Never let the shell itself navigate away from the app — except to an
-  // OAuth provider origin, where the sign-in flow must stay in-app for the
-  // session cookie to land in the Electron session (see
-  // OAUTH_PROVIDER_ORIGINS above).
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (!sameAppOrigin(url) && !isOAuthProviderOrigin(url)) {
       event.preventDefault();
-      openExternalHttps(url);
+      openOutside(url);
     }
   });
+
+  abortInferenceWith(mainWindow.webContents);
+
+  pets?.onMainWindowCreated(mainWindow);
 
   mainWindow.on('closed', () => {
     mainWindow = null;
+    // Close to tray (pets lifecycle): the window is destroyed, the app stays.
+    pets?.onMainWindowClosed();
   });
+  return mainWindow;
 }
 
-function createBridgeInfoWindow() {
-  if (bridgeInfoWindow && !bridgeInfoWindow.isDestroyed()) {
-    bridgeInfoWindow.focus();
+/**
+ * Show the main window, recreating it when it was closed to the tray.
+ * @param {string} [path]
+ */
+function focusMainWindow(path) {
+  if (pets && path === ASK_PATH) {
+    // The native pet's "Ask an F1 question…" while the app was closed.
+    void pets.openAsk();
     return;
   }
-  bridgeInfoWindow = new BrowserWindow({
-    width: 480,
-    height: 580,
-    resizable: false,
-    title: 'TracingInsights Bridge',
-    autoHideMenuBar: true,
-    webPreferences: {
-      preload: join(__dirname, 'bridge-info-preload.cjs'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true
-    }
-  });
-  bridgeInfoWindow.loadFile(BRIDGE_INFO_FILE);
-  bridgeInfoWindow.on('closed', () => {
-    bridgeInfoWindow = null;
-  });
-}
-
-function focusMainWindow() {
-  if (!mainWindow) return;
+  if (pets) {
+    pets.lifecycle.openMain(path);
+    return;
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow(path);
+    return;
+  }
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
 }
 
 // ---------------------------------------------------------------------------
-// IPC (used by preload.cjs and the bridge-info window)
-// ---------------------------------------------------------------------------
-
-/**
- * Token-bearing bridge IPC is available only to the app document in the main
- * window and the exact local Bridge Info document. The main preload also runs
- * while in-app OAuth navigates through GitHub/Google, so exposing the API in
- * the renderer is not itself proof that the caller is trusted.
- */
-function isTrustedBridgeIpcSender(event) {
-  const senderUrl = event.senderFrame?.url;
-  if (!senderUrl) return false;
-
-  const fromApp =
-    mainWindow &&
-    !mainWindow.isDestroyed() &&
-    event.sender === mainWindow.webContents &&
-    sameAppOrigin(senderUrl);
-  const fromBridgeInfo =
-    bridgeInfoWindow &&
-    !bridgeInfoWindow.isDestroyed() &&
-    event.sender === bridgeInfoWindow.webContents &&
-    isBridgeInfoUrl(senderUrl);
-
-  return Boolean(fromApp || fromBridgeInfo);
-}
-
-function assertTrustedBridgeIpcSender(event) {
-  if (!isTrustedBridgeIpcSender(event)) {
-    throw new Error('Bridge IPC is not available from this page');
-  }
-}
-
-function assertBridgeInfoIpcSender(event) {
-  const senderUrl = event.senderFrame?.url;
-  const trusted =
-    senderUrl &&
-    bridgeInfoWindow &&
-    !bridgeInfoWindow.isDestroyed() &&
-    event.sender === bridgeInfoWindow.webContents &&
-    isBridgeInfoUrl(senderUrl);
-  if (!trusted) {
-    throw new Error('Bridge Info IPC is not available from this page');
-  }
-}
-
-async function resetBridgeToken() {
-  const next = randomBytes(32).toString('base64url');
-  persistToken(next);
-  bridgeToken = next;
-  // Wait for the old socket to fully release the port so the retry loop in
-  // startBridge() does not bump to a new port (which would strand the web
-  // app's stored bridge URL).
-  await stopBridgeAsync();
-  await startBridge();
-  return bridgeInfo();
-}
-
-/**
- * Push the current bridge state to every window that surfaces it: the Bridge
- * Info window (token/URL display) and the main window's web app. The web app
- * uses the push to swap the rotated pairing token into its encrypted config,
- * so Codex/Grok calls keep flowing and the settings panel never shows a
- * false "Active" with a token the bridge now rejects.
- */
-function notifyBridgeChanged() {
-  const info = bridgeInfo();
-  if (
-    bridgeInfoWindow &&
-    !bridgeInfoWindow.isDestroyed() &&
-    isBridgeInfoUrl(bridgeInfoWindow.webContents.getURL())
-  ) {
-    bridgeInfoWindow.webContents.send('bridge:changed', info);
-  }
-  if (
-    mainWindow &&
-    !mainWindow.isDestroyed() &&
-    sameAppOrigin(mainWindow.webContents.getURL())
-  ) {
-    mainWindow.webContents.send('bridge:changed', info);
-  }
-}
-
-/**
- * Shared failure handling for a bridge token reset. stopBridgeAsync() has
- * already taken the bridge down before the restart failed, so push the real
- * state to every window (they must not keep showing a stale "running" with
- * the old token) and rebuild the menu so "Copy Bridge URL" is disabled
- * while the bridge is down.
- */
-function handleBridgeResetFailure(error) {
-  console.error('[bridge] token reset failed', error);
-  notifyBridgeChanged();
-  buildMenu();
-}
-
-ipcMain.handle('bridge:info', (event) => {
-  assertTrustedBridgeIpcSender(event);
-  return bridgeInfo();
-});
-
-ipcMain.handle('bridge:reset-token', async (event) => {
-  assertTrustedBridgeIpcSender(event);
-  try {
-    const info = await resetBridgeToken();
-    notifyBridgeChanged();
-    // A reset can also *recover* a bridge that failed to bind at launch
-    // (menu built with Copy Bridge URL disabled) — rebuild so the item
-    // reflects the now-running bridge.
-    buildMenu();
-    return info;
-  } catch (error) {
-    handleBridgeResetFailure(error);
-    // Rethrow so the caller (Bridge Info window, web app) can surface an
-    // explicit error instead of silently keeping the stale display.
-    throw error;
-  }
-});
-
-ipcMain.handle('bridge:copy-text', (event, text) => {
-  assertBridgeInfoIpcSender(event);
-  clipboard.writeText(String(text ?? ''));
-});
-
-ipcMain.handle('bridge:open-main', (event) => {
-  assertBridgeInfoIpcSender(event);
-  focusMainWindow();
-});
-
-// ---------------------------------------------------------------------------
 // Auto-update (electron-updater → GitHub Releases)
-//
-// Production builds check for updates ~10 s after launch and on demand via
-// the menu. Downloads are user-confirmed; once downloaded, the app installs
-// on quit (autoInstallOnAppQuit) or immediately when the user chooses
-// "Restart Now".
-//
-// Requirements / limitations:
-//   - macOS auto-update requires a signed + notarized app (CSC_LINK etc. in
-//     the release workflow); unsigned builds cannot self-update on macOS.
-//   - Linux: AppImage builds auto-update; .deb installs update via apt.
-//   - Dev runs (electron .) never check — only app.isPackaged builds do.
 // ---------------------------------------------------------------------------
 
 let checkingForUpdates = false;
 let lastCheckWasManual = false;
+/** Version downloaded and waiting for a restart, if any. */
+let updateReadyVersion = null;
+/** Started by the native pet's "Restart to update": install once downloaded. */
+let installWhenDownloaded = process.argv.includes(INSTALL_UPDATE_ARG);
+let updaterSetUp = false;
+
+/** Restart into the downloaded update — a running native pet exits first. */
+function installUpdate() {
+  const petGone = pets?.prepareForUpdate() ?? null;
+  if (!petGone) {
+    autoUpdater.quitAndInstall();
+    return;
+  }
+  petGone
+    .catch((error) => console.warn('[updater] native pet:', error))
+    .then(() => autoUpdater.quitAndInstall());
+}
 
 function setupAutoUpdater() {
-  if (!app.isPackaged) return;
+  if (!app.isPackaged || updaterSetUp) return;
+  updaterSetUp = true;
 
-  autoUpdater.autoDownload = false;
+  // Download in the background; install on quit or from "Restart to update".
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
   autoUpdater.logger = console;
 
   autoUpdater.on('error', (error) => {
@@ -587,28 +371,20 @@ function setupAutoUpdater() {
   });
 
   autoUpdater.on('update-available', (info) => {
-    console.log('[updater] update available:', info?.version);
+    console.log('[updater] update available, downloading:', info?.version);
     checkingForUpdates = false;
-    dialog
-      .showMessageBox(mainWindow ?? undefined, {
-        type: 'info',
-        buttons: ['Download', 'Later'],
-        defaultId: 0,
-        cancelId: 1,
-        title: 'Update available',
-        message: `TracingInsights ${info?.version} is available.`,
-        detail: 'Download it now? It will install automatically on quit.'
-      })
-      .then(({ response }) => {
-        if (response === 0) {
-          autoUpdater
-            .downloadUpdate()
-            .catch((error) =>
-              console.error('[updater] download failed:', error)
-            );
-        }
-      })
-      .catch(() => {});
+    if (lastCheckWasManual) {
+      dialog
+        .showMessageBox(mainWindow ?? undefined, {
+          type: 'info',
+          buttons: ['OK'],
+          defaultId: 0,
+          title: 'Update available',
+          message: `TracingInsights ${info?.version} is downloading.`,
+          detail: "You'll be asked to restart when it is ready."
+        })
+        .catch(() => {});
+    }
   });
 
   autoUpdater.on('update-not-available', (info) => {
@@ -628,25 +404,34 @@ function setupAutoUpdater() {
   });
 
   autoUpdater.on('update-downloaded', (info) => {
-    console.log('[updater] update downloaded:', info?.version);
-    dialog
-      .showMessageBox(mainWindow ?? undefined, {
-        type: 'info',
-        buttons: ['Restart Now', 'Later'],
-        defaultId: 0,
-        cancelId: 1,
-        title: 'Update ready',
-        message: `TracingInsights ${info?.version} has been downloaded.`,
-        detail: 'Restart the app to finish installing.'
-      })
-      .then(({ response }) => {
-        if (response === 0) autoUpdater.quitAndInstall();
-      })
-      .catch(() => {});
+    const version = info?.version ?? '';
+    console.log('[updater] update downloaded:', version);
+    if (updateReadyVersion === version) return;
+    updateReadyVersion = version;
+    const install = () => installUpdate();
+    if (installWhenDownloaded) {
+      installWhenDownloaded = false;
+      install();
+      return;
+    }
+    // The main window may be closed to the tray: offer the restart from the
+    // tray menu, the app menu and a notification instead of a window dialog.
+    pets?.setUpdateReady(version, install);
+    buildMenu();
+    // Off in the pets settings → only the tray + app menu offer it.
+    const notify = pets?.notify ?? createNotifier({ Notification });
+    notify({
+      title: 'Update ready',
+      body: `TracingInsights ${version} is ready. Click to restart now, or it installs when you quit.`,
+      onClick: install
+    });
   });
 
-  // Don't block startup; the window is already up by this point.
-  setTimeout(() => checkForUpdates(false), UPDATE_CHECK_STARTUP_DELAY_MS);
+  setTimeout(
+    () => checkForUpdates(false),
+    installWhenDownloaded ? 0 : UPDATE_CHECK_STARTUP_DELAY_MS
+  );
+  setInterval(() => checkForUpdates(false), UPDATE_CHECK_INTERVAL_MS);
 }
 
 function checkForUpdates(manual = false) {
@@ -673,52 +458,34 @@ function buildMenu() {
   const template = [
     ...(process.platform === 'darwin' ? [{ role: 'appMenu' }] : []),
     {
-      label: 'Bridge',
+      label: 'TracingInsights',
       submenu: [
-        { label: 'Show Bridge Info', click: () => createBridgeInfoWindow() },
-        {
-          label: 'Copy Bridge URL',
-          // Evaluated when the menu is built (after startBridge()), so a
-          // bridge that failed to bind a port shows the item disabled. The
-          // click also guards, covering a later shutdown (e.g. a token
-          // reset that could not restart the bridge).
-          enabled: Boolean(bridgeUrl()),
-          click: () => {
-            const url = bridgeUrl();
-            if (url) clipboard.writeText(url);
-          }
-        },
-        { type: 'separator' },
-        {
-          label: 'Reset Bridge Token',
-          click: () => {
-            resetBridgeToken()
-              .then(() => {
-                notifyBridgeChanged();
-                // A reset can also *recover* a bridge that failed to bind
-                // at launch (menu built with Copy Bridge URL disabled) —
-                // rebuild so the item reflects the now-running bridge.
-                buildMenu();
-              })
-              .catch((error) => {
-                handleBridgeResetFailure(error);
-                dialog.showErrorBox(
-                  'Bridge reset failed',
-                  'The bridge could not restart because every candidate port ' +
-                    'is in use.\n\n' +
-                    (error instanceof Error ? error.message : String(error))
-                );
-              });
-          }
-        },
-        { type: 'separator' },
         { label: 'Open TracingInsights', click: () => focusMainWindow() },
+        { label: 'Pets…', click: () => focusMainWindow('/settings/pets') },
         { type: 'separator' },
         {
-          label: 'Check for Updates…',
-          enabled: app.isPackaged,
-          click: () => checkForUpdates(true)
-        }
+          label: 'Copy App URL',
+          click: () => clipboard.writeText(APP_URL)
+        },
+        { type: 'separator' },
+        updateReadyVersion
+          ? {
+              label: `Restart to Update (${updateReadyVersion})`,
+              click: () => installUpdate()
+            }
+          : {
+              label: 'Check for Updates…',
+              enabled: app.isPackaged,
+              click: () => checkForUpdates(true)
+            },
+        // Closing the window keeps the app in the tray, so Windows/Linux
+        // need an explicit Quit here (macOS has it in the app menu).
+        ...(process.platform === 'darwin'
+          ? []
+          : [
+              { type: 'separator' },
+              { role: 'quit', label: 'Quit TracingInsights' }
+            ])
       ]
     },
     { role: 'editMenu' },
@@ -732,50 +499,189 @@ function buildMenu() {
 // App lifecycle
 // ---------------------------------------------------------------------------
 
+// Pets: read before `ready` — the Linux XWayland decision and the privileged
+// schemes (registerSchemesAsPrivileged may be called once, before ready).
+const earlyPetSettings = readSettingsSync(app.getPath('userData'));
+protocol.registerSchemesAsPrivileged([...PET_PRIVILEGED_SCHEMES]);
+
+/**
+ * The bundled native pet for this platform/arch, else null (→ the Electron
+ * pet). Dev runs can point TIF1AI_NATIVE_PET at a local build.
+ */
+function nativePetBinaryPath() {
+  const override = process.env.TIF1AI_NATIVE_PET;
+  if (override) return existsSync(override) ? override : null;
+  if (!app.isPackaged || !process.resourcesPath) return null;
+  const path = join(
+    process.resourcesPath,
+    'ti-pet',
+    nativeBinaryName(process.platform, process.arch)
+  );
+  return existsSync(path) ? path : null;
+}
+const NATIVE_PET_PATH = nativePetBinaryPath();
+/**
+ * The native pet runs on XWayland itself: no Electron relaunch for it —
+ * unless this binary failed to start last time (it is still tried, but the
+ * fallback pet must be able to show on a Wayland session).
+ */
+const nativePetExpected =
+  NATIVE_PET_PATH !== null &&
+  process.env.TIF1AI_PETS_RENDERER !== 'electron' &&
+  !lastNativeStartFailed({
+    fs: nodeFs,
+    userDataDir: app.getPath('userData'),
+    binaryPath: NATIVE_PET_PATH
+  });
+/** `--pets-refresh`: windowless timeline recompile, then exit. */
+let refreshRun = process.argv.includes(REFRESH_ARG);
+const startOpenPath = parsePetsOpenArg(process.argv);
+
+/** A second start (or --pets-open) during a refresh run: become a normal app. */
+function promoteRefreshRun() {
+  if (!refreshRun) return;
+  refreshRun = false;
+  pets?.promote();
+  buildMenu();
+  setupAutoUpdater();
+}
+
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
+} else if (
+  relaunchUnderXWaylandIfNeeded({
+    app,
+    platform: process.platform,
+    env: process.env,
+    argv: process.argv,
+    enabled:
+      earlyPetSettings.enabled &&
+      earlyPetSettings.activePetId !== null &&
+      !nativePetExpected
+  })
+) {
+  // Relaunching with --ozone-platform=x11 (pets on in a Wayland session).
 } else {
-  app.on('second-instance', () => focusMainWindow());
+  app.on('second-instance', (_event, argv) => {
+    promoteRefreshRun();
+    if (Array.isArray(argv) && argv.includes(INSTALL_UPDATE_ARG)) {
+      if (updateReadyVersion) installUpdate();
+      else {
+        installWhenDownloaded = true;
+        checkForUpdates(false);
+      }
+      return;
+    }
+    focusMainWindow(
+      (Array.isArray(argv) ? parsePetsOpenArg(argv) : null) ?? undefined
+    );
+  });
 
   app.whenReady().then(async () => {
-    let bridgeStartError = null;
-    try {
-      await startBridge();
-    } catch (error) {
-      console.error('[bridge] failed to start localhost bridge:', error);
-      bridgeStartError = error;
+    harness = buildHarness();
+    pets = buildPets();
+    if (refreshRun && pets) {
+      // No window, menu or updater: recompile, hand over, exit.
+      void pets.refreshAndExit({ exit: () => app.exit(0) });
+      return;
     }
-    // Must run before any window loads the app so the first document request
-    // (and every subsequent app-origin request) carries the marker header.
-    setupDesktopShellHeader();
+    refreshRun = false;
     buildMenu();
-    createWindow();
+    // Started at login (`--hidden`): tray + pet only, no main window.
+    // Otherwise the first start with no pet opens the welcome step once.
+    // `--pets-install-update`: no window either, the update installs.
+    const hidden =
+      (pets?.lifecycle.startedHidden() ?? false) || installWhenDownloaded;
+    if (!hidden) {
+      if (startOpenPath) focusMainWindow(startOpenPath);
+      else if (pets) pets.lifecycle.startMain();
+      else createWindow();
+    }
+    try {
+      pets?.start({ hidden, handOff: !installWhenDownloaded });
+    } catch (error) {
+      console.error('[pets] could not start:', error);
+    }
     setupAutoUpdater();
 
-    // Show the failure only once the window exists, so a blocked bridge does
-    // not delay app startup (showErrorBox is synchronous on Linux/Windows).
-    if (bridgeStartError) {
-      dialog.showErrorBox(
-        'Bridge unavailable',
-        'The localhost bridge could not start, so Codex and Grok calls will ' +
-          'use the TracingInsights server proxy instead.\n\n' +
-          (bridgeStartError instanceof Error
-            ? bridgeStartError.message
-            : String(bridgeStartError))
-      );
-    }
-
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+      if (!mainWindow || mainWindow.isDestroyed()) focusMainWindow();
     });
   });
 
-  app.on('window-all-closed', () => {
-    // macOS keeps the app (and bridge) alive in the dock; other platforms
-    // quit and take the bridge down with them.
-    if (process.platform !== 'darwin') app.quit();
-  });
+  app.on('before-quit', (event) => pets?.beforeQuit(event));
 
-  app.on('before-quit', () => stopBridge());
+  app.on('window-all-closed', () => {
+    // Close to tray (default) keeps the app running with the tray (+ pet);
+    // with it off: macOS stays in the dock, other platforms quit and take
+    // the harness down with them.
+    const quit = pets
+      ? pets.shouldQuitOnAllClosed()
+      : process.platform !== 'darwin';
+    if (quit) app.quit();
+  });
+}
+
+/** The pets runtime, or null if it failed (the app itself must still open). */
+function buildPets() {
+  try {
+    return createPetsRuntime({
+      electron: {
+        app,
+        BrowserWindow,
+        Menu,
+        Notification,
+        Tray,
+        dialog,
+        ipcMain,
+        nativeImage,
+        powerMonitor,
+        screen,
+        session,
+        systemPreferences
+      },
+      appUrl: APP_URL,
+      appOrigin: APP_ORIGIN,
+      getMainWindow: () => mainWindow,
+      createMainWindow: (path) => createWindow(path),
+      userDataDir: app.getPath('userData'),
+      // 64 px copy of build/icon.png inside src/ (packaged with the app).
+      iconPath: join(__dirname, 'pets', 'tray-icon.png'),
+      windowIconPath:
+        process.platform !== 'darwin' &&
+        existsSync(join(__dirname, '..', 'build', 'icon.png'))
+          ? join(__dirname, '..', 'build', 'icon.png')
+          : undefined,
+      openExternal: openExternalHttps,
+      petPageDir: join(__dirname, 'pet'),
+      petPreloadPath: join(__dirname, 'pet-preload.cjs'),
+      mainPreloadPath: WINDOW_WEB_PREFERENCES.preload,
+      onAskWindowCreated: (window) => abortInferenceWith(window.webContents),
+      platform: process.platform,
+      env: process.env,
+      argv: process.argv,
+      execPath: process.execPath,
+      homeDir: homedir(),
+      appVersion: app.getVersion(),
+      nativePetPath: NATIVE_PET_PATH,
+      // How the native pet starts this app again (dev: electron + app dir).
+      appLaunch: {
+        execPath: process.env.APPIMAGE || process.execPath,
+        args: appLaunchArgs(process.argv, {
+          isPackaged: app.isPackaged,
+          appPath: app.getAppPath()
+        })
+      },
+      tmpDir: tmpdir(),
+      // A hand-off quit leaves the native pet running: a pending update must
+      // not install now (Windows cannot replace the running pet).
+      beforeHandoffQuit: () => {
+        autoUpdater.autoInstallOnAppQuit = false;
+      }
+    });
+  } catch (error) {
+    console.error('[pets] disabled:', error);
+    return null;
+  }
 }

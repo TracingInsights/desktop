@@ -41,6 +41,18 @@ directories:
 files:
   - src/**/*
   - package.json
+# Native pet (docs/DESKTOP_PETS_NATIVE_PLAN.md N5): scripts/fetch-native-pet.mjs
+# fills resources/ti-pet/ with the pinned, hash-verified ti-pet binaries before
+# a release build. Empty → the installer ships without it and the Electron pet
+# runs (fallback). At runtime: process.resourcesPath/ti-pet/. The committed
+# license texts (Petdex MIT, Native SDK Apache-2.0) always ship beside it.
+extraResources:
+  - from: resources/ti-pet
+    to: ti-pet
+    filter:
+      - 'ti-pet-*'
+      - 'LICENSE-*.txt'
+      - 'THIRD-PARTY-NOTICES.md'
 asar: true
 npmRebuild: false
 # electron-updater reads this to find updates. The PUBLIC releases repo
@@ -74,6 +86,22 @@ linux:
     - AppImage
     - deb
   category: Utility
+deb:
+  # electron-builder's defaults (FpmTarget) + what the native pet needs: GTK 4
+  # and the WebP loader for gdk-pixbuf (Petdex sprites are WebP). Setting
+  # `depends` replaces the defaults, so they are repeated here.
+  depends:
+    - libgtk-3-0
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libatspi2.0-0
+    - libuuid1
+    - libsecret-1-0
+    - libgtk-4-1
+    - webp-pixbuf-loader
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true

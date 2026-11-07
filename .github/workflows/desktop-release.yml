@@ -81,7 +81,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.4
 
       - name: Cache Bun install
         uses: actions/cache@v6
@@ -100,6 +100,19 @@ jobs:
         run: |
           bun run icons
           git diff --exit-code -- build/
+
+      # Native pet (docs/DESKTOP_PETS_NATIVE_PLAN.md N5): download the
+      # ti-pet binaries pinned in native-pet.json and verify their SHA-256
+      # into resources/ti-pet/ (electron-builder extraResources). Unpinned →
+      # a warning and an installer without it (Electron pet fallback).
+      - name: Fetch the pinned native pet
+        shell: bash
+        run: |
+          case "${{ matrix.os }}" in
+            macos-*) bun run scripts/fetch-native-pet.mjs --write --target darwin ;;
+            windows-*) bun run scripts/fetch-native-pet.mjs --write --target win32-x64 ;;
+            *) bun run scripts/fetch-native-pet.mjs --write --target linux-x64 ;;
+          esac
 
       # electron-builder publishes to the release for the pushed tag: with the
       # default vPrefixedTagName its computed tag (v<package version>) matches
