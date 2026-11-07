@@ -69,12 +69,18 @@ mac:
   category: public.app-category.utilities
   # Universal binaries: one dmg/zip serves Apple Silicon and Intel, so the
   # site's single macOS download link works for everyone. Safe here because
-  # the app has no native modules (pure JS + Electron's own prebuilds).
+  # the app has no native modules (pure JS + Electron's own prebuilds); the
+  # native pet ships both arch binaries side by side (see x64ArchFiles).
   target:
     - target: dmg
       arch: [universal]
     - target: zip
       arch: [universal]
+  # Both native pet binaries ship in Resources/ti-pet/ (main.mjs picks
+  # ti-pet-darwin-<process.arch>), so they are identical in the x64 and arm64
+  # slices; @electron/universal refuses identical Mach-O files it is not told
+  # about ("not covered by the x64ArchFiles rule").
+  x64ArchFiles: 'Contents/Resources/ti-pet/ti-pet-darwin-*'
   darkModeSupport: true
 win:
   icon: build/icon.ico
