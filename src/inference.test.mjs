@@ -108,6 +108,43 @@ describe('inference dispatcher', () => {
     expect(signalSeen.aborted).toBe(true);
   });
 
+  test('request ids are scoped per sender (main and ask windows)', async () => {
+    const signals = [];
+    const inference = makeInference({
+      codexInference: {
+        run: async ({ signal }) => {
+          signals.push(signal);
+          return new Promise((resolve) => {
+            signal.addEventListener(
+              'abort',
+              () => resolve({ ok: false, error: { code: 'aborted' } }),
+              { once: true }
+            );
+          });
+        }
+      }
+    });
+    const main = { id: 1 };
+    const ask = { id: 2 };
+    const start = (scope) =>
+      inference.generate({
+        providerId: 'codex',
+        model: 'm',
+        messages: [],
+        requestId: 'same-id',
+        scope
+      });
+    const fromMain = start(main);
+    const fromAsk = start(ask);
+    await delay(10);
+    inference.abort('same-id', ask);
+    expect((await fromAsk).error.code).toBe('aborted');
+    expect(signals.map((signal) => signal.aborted)).toEqual([false, true]);
+    // The main window's request still runs and can still be aborted.
+    inference.abort('same-id', main);
+    expect((await fromMain).error.code).toBe('aborted');
+  });
+
   test('rejects an unknown custom provider', async () => {
     const inference = makeInference();
     const result = await inference.generate({

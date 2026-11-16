@@ -104,12 +104,15 @@ describe('validatePetJson', () => {
     expect(validatePetJson(petJson({ spritesheetPath: path })).ok).toBe(false);
   });
 
-  test('spriteVersionNumber must be 1 or 2', () => {
-    expect(validatePetJson(petJson({ spriteVersionNumber: 3 })).ok).toBe(false);
-    expect(
-      validatePetJson(petJson({ spriteVersionNumber: 2 })).petJson
-        .spriteVersionNumber
-    ).toBe(2);
+  test('spriteVersionNumber: 1 | 2 kept, anything else ignored (never rejected)', () => {
+    const declared = (v) =>
+      validatePetJson(petJson({ spriteVersionNumber: v })).petJson
+        ?.spriteVersionNumber;
+    expect(declared(2)).toBe(2);
+    expect(declared(1)).toBe(1);
+    for (const odd of [3, 0, '2', 2.5, null, undefined, [2], { v: 2 }]) {
+      expect(declared(odd)).toBeNull();
+    }
   });
 
   test('isBareSpritePath', () => {
@@ -182,10 +185,23 @@ describe('validatePet', () => {
     ).toBe(false);
   });
 
-  test('version mismatch fails', () => {
-    const r = validate({ spriteVersionNumber: 2 }, fakePng(1536, 1872));
-    expect(r.ok).toBe(false);
-    expect(r.error).toContain('version 2');
+  test('the sheet size settles the version, whatever pet.json declares', () => {
+    for (const declared of [undefined, 1, 2, 3, '2']) {
+      const v1 = validate(
+        { spriteVersionNumber: declared },
+        fakePng(1536, 1872)
+      );
+      expect(v1.ok && v1.pet.atlas).toMatchObject({ version: 1, rows: 9 });
+      const v2 = validate(
+        { spriteVersionNumber: declared },
+        fakePng(768, 1144)
+      );
+      expect(v2.ok && v2.pet.atlas).toMatchObject({
+        version: 2,
+        rows: 11,
+        scale: 0.5
+      });
+    }
   });
 
   test('missing image fails', () => {

@@ -266,7 +266,77 @@ function delayedSse(delayMs, frame) {
   };
 }
 
+/** fetch mock streaming one frame every `everyMs`, erroring on abort. */
+function pacedSse(everyMs, frames) {
+  return async (_url, init) => {
+    const body = new ReadableStream({
+      start(c) {
+        let i = 0;
+        const t = setInterval(() => {
+          if (i < frames.length) {
+            c.enqueue(new TextEncoder().encode(frames[i++]));
+            return;
+          }
+          clearInterval(t);
+          c.close();
+        }, everyMs);
+        init.signal?.addEventListener('abort', () => {
+          clearInterval(t);
+          c.error(init.signal.reason);
+        });
+      }
+    });
+    return new Response(body, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' }
+    });
+  };
+}
+
 describe('watchdogs', () => {
+  test('reasoning deltas end the first-token grace in every adapter', async () => {
+    // 6 reasoning frames 25 ms apart outlast the 80 ms grace; the idle
+    // watchdog (60 ms) keeps re-arming on them, so the answer arrives.
+    const run = (runner, baseUrl, reasoning, answer) =>
+      runner({
+        baseUrl,
+        model: 'm',
+        messages: [{ role: 'user', content: 'x' }],
+        stream: true,
+        onDelta: () => {},
+        fetchImpl: pacedSse(25, [
+          ...Array.from({ length: 6 }, () => `data: ${reasoning}\n\n`),
+          `data: ${answer}\n\n`
+        ]),
+        idleTimeoutMs: 60,
+        firstTokenTimeoutMs: 80
+      });
+    expect(
+      await run(
+        runCompletions,
+        'http://127.0.0.1:11434/v1',
+        '{"choices":[{"delta":{"reasoning_content":"hmm"}}]}',
+        '{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}'
+      )
+    ).toMatchObject({ ok: true, text: 'hi' });
+    expect(
+      await run(
+        runResponses,
+        'http://127.0.0.1:11434/v1',
+        '{"type":"response.reasoning_summary_text.delta","delta":"hmm"}',
+        '{"type":"response.output_text.delta","delta":"hi"}'
+      )
+    ).toMatchObject({ ok: true, text: 'hi' });
+    expect(
+      await run(
+        runAnthropic,
+        'https://api.anthropic.com/v1',
+        '{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}',
+        '{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}'
+      )
+    ).toMatchObject({ ok: true, text: 'hi' });
+  });
+
   test('the idle watchdog does not pre-empt the first-token grace', async () => {
     const r = await runCompletions({
       baseUrl: 'http://127.0.0.1:11434/v1',

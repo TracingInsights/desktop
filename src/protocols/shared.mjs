@@ -32,6 +32,80 @@ function readPositiveInt(raw, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function networkError(message) {
+  const err = new Error(message);
+  err.code = 'network';
+  return err;
+}
+
+/**
+ * The watchdogs of one provider round-trip. Timeouts live in a private
+ * controller combined with the caller's signal, so either an explicit
+ * abort(requestId) or an internal expiry tears the fetch down; a timeout
+ * aborts with a `code: 'network'` Error to tell it from a user abort.
+ *
+ * Call `armFirstToken()` BEFORE the request, so a hung connect / header wait
+ * / blocking (non-stream) call is bounded by the first-token grace (model
+ * cold load). `clearFirst()` on the first token (answer or reasoning) hands
+ * over to the idle watchdog, which `armIdle()` re-arms per chunk — arming
+ * both at stream start let the shorter idle timeout fire during a legitimate
+ * cold load and pre-empt the grace period. `dispose()` when the call ends.
+ * @param {{ signal?: AbortSignal, idleTimeoutMs?: number, firstTokenTimeoutMs?: number }} options
+ */
+export function createStreamWatchdog({
+  signal,
+  idleTimeoutMs,
+  firstTokenTimeoutMs
+}) {
+  const timeoutController = new AbortController();
+  const combined = signal
+    ? AbortSignal.any([signal, timeoutController.signal])
+    : timeoutController.signal;
+
+  let idleTimer;
+  let firstTokenTimer;
+  const armIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = null;
+    // The first-token grace governs until the first token arrives.
+    if (firstTokenTimer) return;
+    if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) return;
+    idleTimer = setTimeout(
+      () =>
+        timeoutController.abort(
+          networkError('Provider stream was idle for too long.')
+        ),
+      idleTimeoutMs
+    );
+  };
+  const armFirstToken = () => {
+    if (!Number.isFinite(firstTokenTimeoutMs) || firstTokenTimeoutMs <= 0)
+      return;
+    firstTokenTimer = setTimeout(
+      () =>
+        timeoutController.abort(
+          networkError('Timed out waiting for the first token.')
+        ),
+      firstTokenTimeoutMs
+    );
+  };
+  const clearFirst = () => {
+    if (firstTokenTimer) clearTimeout(firstTokenTimer);
+    firstTokenTimer = null;
+  };
+
+  return {
+    signal: combined,
+    armIdle,
+    armFirstToken,
+    clearFirst,
+    dispose() {
+      clearTimeout(idleTimer);
+      clearFirst();
+    }
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Target validation (D4)
 // ---------------------------------------------------------------------------

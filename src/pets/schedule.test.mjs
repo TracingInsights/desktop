@@ -146,7 +146,7 @@ describe('createSchedule', () => {
         return respond(url, init);
       },
       userDataDir: root,
-      appUrl: 'https://app.tracinginsights.com',
+      appUrl: 'https://tracinginsights.com',
       now: () => clock,
       setTimeout: (fn, ms) => {
         const t = { fn, ms };
@@ -174,7 +174,7 @@ describe('createSchedule', () => {
     schedule.onChange((s) => changes.push(s.length));
     await schedule.start();
     expect(calls[0].url).toBe(
-      'https://app.tracinginsights.com/desktop/schedule.json'
+      'https://tracinginsights.com/desktop/schedule.json'
     );
     expect(schedule.sessions().map((s) => s.kind)).toEqual([
       'qualifying',
@@ -504,7 +504,7 @@ describe('createSchedule — companion getters', () => {
         return new Response(JSON.stringify(body));
       },
       userDataDir: root,
-      appUrl: 'https://app.tracinginsights.com',
+      appUrl: 'https://tracinginsights.com',
       now: () => clock,
       setTimeout: () => 0,
       clearTimeout: () => {}
@@ -562,7 +562,7 @@ describe('createSchedule — companion getters', () => {
     const schedule = createSchedule({
       fetch: async () => new Response(JSON.stringify(body)),
       userDataDir: root,
-      appUrl: 'https://app.tracinginsights.com',
+      appUrl: 'https://tracinginsights.com',
       now: () => at('2026-11-09T00:00:00Z'),
       setTimeout: () => 0,
       clearTimeout: () => {}

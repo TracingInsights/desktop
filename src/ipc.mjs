@@ -8,6 +8,7 @@
  * discriminated envelope (`{ ok: true, … } | { ok: false, error }`) instead of
  * rejecting (ipcRenderer.invoke rejections drop custom fields).
  */
+import { isAppOrigin } from './app-origin.mjs';
 import { STATIC_CODEX_MODELS, STATIC_XAI_MODELS } from './model-catalogs.mjs';
 
 /**
@@ -16,15 +17,17 @@ import { STATIC_CODEX_MODELS, STATIC_XAI_MODELS } from './model-catalogs.mjs';
  * Pure and unit-testable: `context.mainWindow` is the BrowserWindow (or null),
  * `context.windows` optional further app windows trusted the same way (the
  * pets quick-ask window; null entries ignored) and `context.appOrigin` the
- * app URL origin. Every window still needs an app-origin document.
+ * app URL origin, or the list of them (`appOriginsFor`). Every window still
+ * needs an app-origin document.
  * @param {any} event
- * @param {{ mainWindow: any, windows?: any[], appOrigin: string }} context
+ * @param {{ mainWindow: any, windows?: any[], appOrigin: string | readonly string[] }} context
  */
 export function isTrustedAppSender(event, context) {
   const senderUrl = event?.senderFrame?.url;
   if (!senderUrl) return false;
   try {
-    if (new URL(senderUrl).origin !== context.appOrigin) return false;
+    if (!isAppOrigin(new URL(senderUrl).origin, context.appOrigin))
+      return false;
   } catch {
     return false;
   }
@@ -142,6 +145,7 @@ export function createHarnessIpc(deps) {
         try {
           return await inference.generate({
             ...(input ?? {}),
+            scope: event.sender,
             fetchImpl: globalThis.fetch
           });
         } finally {
@@ -153,6 +157,7 @@ export function createHarnessIpc(deps) {
         const untrack = track(event.sender, input?.requestId);
         return inference.stream({
           ...(input ?? {}),
+          scope: event.sender,
           send: (channel, payload) => {
             if (channel === 'inference:end') untrack();
             if (!event.sender.isDestroyed()) {
@@ -162,8 +167,8 @@ export function createHarnessIpc(deps) {
         });
       });
 
-      register('inference:abort', (_event, requestId) =>
-        inference.abort(requestId)
+      register('inference:abort', (event, requestId) =>
+        inference.abort(requestId, event.sender)
       );
     },
 
@@ -176,7 +181,42 @@ export function createHarnessIpc(deps) {
       const ids = requestsBySender.get(sender);
       if (!ids) return;
       requestsBySender.delete(sender);
-      for (const requestId of ids) inference.abort(requestId);
+      for (const requestId of ids) inference.abort(requestId, sender);
     }
   };
+}
+
+/** The path of a URL (origin + pathname), or null when it does not parse. */
+function documentPath(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.origin + parsed.pathname;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Call `abort` when a window's document goes away: a real navigation (incl.
+ * a reload), destruction, or a same-document navigation of the main frame
+ * to another path (a client-side route change). Pages rewrite their own
+ * query or hash with `history.replaceState` while an answer streams (the
+ * ti-home dashboard on every selection change), so those never abort.
+ * @param {{ on: (event: string, listener: (...args: any[]) => void) => void }} webContents
+ * @param {() => void} abort
+ */
+export function abortOnNavigation(webContents, abort) {
+  let path = null;
+  webContents.on('did-navigate', (_event, url) => {
+    path = documentPath(url);
+    abort();
+  });
+  webContents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
+    if (isMainFrame === false) return;
+    const next = documentPath(url);
+    if (next === path) return;
+    path = next;
+    abort();
+  });
+  webContents.on('destroyed', abort);
 }

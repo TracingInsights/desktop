@@ -14,7 +14,10 @@
  *     quietUntil?: ISO|null,          // Quiet ▸ (null = Quiet off)
  *     launchAtLogin?: boolean,
  *     position?: { x, y },            // last drop point → positions.last
- *     shownMoments?: { name: 'lastResultKey'|'lastRateKey'|'lastFactDay', value }[]
+ *     shownMoments?: { name, value }[], // MARKER_SETTINGS names: lastResultKey,
+ *                                     // lastRateKey, lastFactDay, lastGreetingKey
+ *     mutes?: string[]                // round 3: bubble kinds switched off with an
+ *                                     // offline "No …" button → MUTE_ACTIONS patches
  *   }
  *
  * On start Electron merges every valid field into its settings (invalid
@@ -27,6 +30,7 @@ import { PET_SIZES } from './contract.mjs';
 import { NATIVE_STATE_FILE, NATIVE_STATE_VERSION } from './native-protocol.mjs';
 import { LAST_POSITION_KEY } from './pet-window.mjs';
 import { MARKER_SETTINGS } from './settings.mjs';
+import { MUTE_ACTIONS } from './bubble-actions.mjs';
 
 const MAX_BYTES = 64 * 1024;
 const MAX_MOMENTS = 32;
@@ -38,7 +42,9 @@ const isIso = (v) =>
   Number.isFinite(Date.parse(v));
 
 /**
- * The settings patch + markers a native-state document asks for (pure).
+ * The settings patch + markers a native-state document asks for (pure). An
+ * offline mute adds its kind's MUTE_ACTIONS patch (the setting the live
+ * "No …" button writes); an unknown kind is skipped.
  * @param {unknown} raw
  * @returns {{ patch: Record<string, unknown>, markers: { name: string, value: string }[], position: { x: number, y: number } | null }}
  */
@@ -64,6 +70,13 @@ export function parseNativeState(raw) {
   }
   if (typeof raw.launchAtLogin === 'boolean') {
     patch.launchAtLogin = raw.launchAtLogin;
+  }
+  if (Array.isArray(raw.mutes)) {
+    for (const kind of raw.mutes) {
+      if (typeof kind === 'string' && Object.hasOwn(MUTE_ACTIONS, kind)) {
+        Object.assign(patch, MUTE_ACTIONS[kind].patch);
+      }
+    }
   }
   const p = raw.position;
   if (

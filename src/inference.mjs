@@ -51,14 +51,29 @@ export function createInference(deps = {}) {
     firstTokenTimeoutMs
   } = deps;
 
-  const active = new Map(); // requestId → { controller, timer, done }
+  // Request ids are chosen by the page, so they are scoped per sender (the
+  // main and quick-ask windows may both use the same id).
+  const active = new Map(); // scope → Map(requestId → AbortController)
 
-  function abortRequest(requestId, reason = 'aborted') {
-    const entry = active.get(requestId);
-    if (!entry) return;
-    entry.controller?.abort(new Error(reason));
-    if (entry.timer) clearTimeout(entry.timer);
-    active.delete(requestId);
+  function track(scope, requestId, controller) {
+    let requests = active.get(scope);
+    if (!requests) active.set(scope, (requests = new Map()));
+    requests.set(requestId, controller);
+    return () => {
+      if (requests.get(requestId) !== controller) return;
+      requests.delete(requestId);
+      if (requests.size === 0 && active.get(scope) === requests)
+        active.delete(scope);
+    };
+  }
+
+  function abortRequest(scope, requestId, reason = 'aborted') {
+    const requests = active.get(scope);
+    const controller = requests?.get(requestId);
+    if (!controller) return;
+    controller.abort(new Error(reason));
+    requests.delete(requestId);
+    if (requests.size === 0) active.delete(scope);
   }
 
   /** Resolve a `providerId` to a runnable adapter function. */
@@ -145,8 +160,7 @@ export function createInference(deps = {}) {
       });
     }
     const controller = new AbortController();
-    const entry = { controller, timer: null, done: false };
-    active.set(requestId, entry);
+    const untrack = track(input.scope, requestId, controller);
 
     try {
       const result = await resolveAdapter(input.providerId).invoke({
@@ -164,8 +178,7 @@ export function createInference(deps = {}) {
       }
       return result;
     } finally {
-      if (entry.timer) clearTimeout(entry.timer);
-      active.delete(requestId);
+      untrack();
     }
   }
 
@@ -200,16 +213,14 @@ export function createInference(deps = {}) {
       }
     };
 
-    const entry = { controller, timer, done: false };
-    active.set(requestId, entry);
+    const untrack = track(input.scope, requestId, controller);
 
     const finish = (payload) => {
       if (finished) return;
       finished = true;
       flush();
       send?.('inference:end', { requestId, ...payload });
-      if (entry.timer) clearTimeout(entry.timer);
-      active.delete(requestId);
+      untrack();
     };
 
     const onDelta = (delta) => {
@@ -260,14 +271,20 @@ export function createInference(deps = {}) {
     return { requestId };
   }
 
-  function abort(requestId) {
-    abortRequest(requestId);
+  /**
+   * @param {unknown} requestId
+   * @param {unknown} [scope] the sender that started it (its webContents)
+   */
+  function abort(requestId, scope) {
+    abortRequest(scope, requestId);
   }
 
   /** Abort every in-flight request (page navigation / window destroyed). */
   function abortAll() {
-    for (const requestId of [...active.keys()]) {
-      abortRequest(requestId);
+    for (const [scope, requests] of [...active]) {
+      for (const requestId of [...requests.keys()]) {
+        abortRequest(scope, requestId);
+      }
     }
   }
 

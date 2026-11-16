@@ -16,6 +16,14 @@ import {
   isInsideDir,
   TIMELINE_SPRITES_DIR
 } from './timeline-sprites.mjs';
+import { createPetStore } from './pet-store.mjs';
+import { parsePetAssetUrl, petAssetUrl } from './protocols.mjs';
+import {
+  fakeDecodeImage,
+  fakeMakeThumb,
+  fakeWebp,
+  petJson
+} from './data-test-helpers.mjs';
 
 const roots = [];
 afterEach(() => {
@@ -94,5 +102,57 @@ describe('createTimelineSpriteResolver', () => {
     const { codex, resolve } = setup();
     rmSync(codex);
     expect(resolve('pet-asset://pet/codex')).toBeNull();
+  });
+
+  test('Petdex CLI and Codex copies of one pet: each gets its own copy inside userData', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ti-sprites-'));
+    roots.push(root);
+    const userDataDir = join(root, 'ud');
+    const sheet = fakeWebp(1536, 2288);
+    const homes = {
+      petdexHome: join(root, '.petdex'),
+      codexHome: join(root, '.codex')
+    };
+    for (const home of Object.values(homes)) {
+      const dir = join(home, 'pets', 'boba');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, 'pet.json'),
+        petJson({ spritesheetPath: 'spritesheet.webp' })
+      );
+      writeFileSync(join(dir, 'spritesheet.webp'), sheet);
+    }
+    const store = createPetStore({
+      userDataDir,
+      ...homes,
+      decodeImage: fakeDecodeImage,
+      makeThumb: fakeMakeThumb,
+      getSettings: () => ({ scanCodexDir: true })
+    });
+    // Same wiring as runtime.mjs: pet-asset URL → store → resolver.
+    const resolve = createTimelineSpriteResolver({
+      userDataDir,
+      fs,
+      resolveSourcePath: (url) => {
+        const id = parsePetAssetUrl(url);
+        return id ? (store.resolveAsset(id)?.path ?? null) : null;
+      }
+    });
+    const cli = resolve(petAssetUrl('petdex-cli:boba', 3));
+    const codex = resolve(petAssetUrl('codex:boba', 3));
+    for (const copy of [cli, codex]) {
+      expect(copy).not.toBeNull();
+      expect(isInsideDir(join(userDataDir, TIMELINE_SPRITES_DIR), copy)).toBe(
+        true
+      );
+      expect(readFileSync(copy).equals(sheet)).toBe(true);
+    }
+    expect(cli).not.toBe(codex);
+    // Neither folder was written to.
+    expect(
+      readFileSync(
+        join(homes.petdexHome, 'pets', 'boba', 'spritesheet.webp')
+      ).equals(sheet)
+    ).toBe(true);
   });
 });

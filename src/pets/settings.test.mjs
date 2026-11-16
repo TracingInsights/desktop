@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import {
   createPetsSettings,
   isDriverId,
+  isPetId,
   readSettingsSync,
   SETTINGS_FILE,
   validatePagePatch
@@ -72,6 +73,20 @@ describe('readSettingsSync', () => {
     expect(s).not.toHaveProperty('evil');
     expect(s.positions).toEqual({ 1: { x: 10, y: 20 } });
   });
+
+  test('roam (round 3): off by default, booleans only', () => {
+    expect(readSettingsSync(dir).roam).toBe(false);
+    writeRaw(JSON.stringify({ roam: true }));
+    expect(readSettingsSync(dir).roam).toBe(true);
+    writeRaw(JSON.stringify({ roam: 'yes' }));
+    expect(readSettingsSync(dir).roam).toBe(false);
+    const settings = createPetsSettings({ userDataDir: dir });
+    expect(settings.update({ roam: true }).ok).toBe(true);
+    expect(settings.get().roam).toBe(true);
+    expect(readRaw().roam).toBe(true);
+    expect(settings.update({ roam: 1 }).ok).toBe(false);
+    expect(settings.get().roam).toBe(true);
+  });
 });
 
 describe('createPetsSettings', () => {
@@ -122,6 +137,23 @@ describe('createPetsSettings', () => {
       quietUntil: '2026-11-06T12:00:00.000Z',
       size: 's'
     });
+  });
+
+  test('pet ids: every PET_SOURCES prefix, nothing else', () => {
+    for (const id of [
+      'petdex:lando',
+      'codex:my%20pet',
+      'import:6f1c2b9e-0a4d-4c55-9a3e-2f6b8d1e7c90',
+      'petdex-cli:boba'
+    ]) {
+      expect(isPetId(id)).toBe(true);
+    }
+    for (const id of ['cli:boba', 'petdex-cli:', 'petdex-cli:a/b', 'x:y', 5]) {
+      expect(isPetId(id)).toBe(false);
+    }
+    const settings = createPetsSettings({ userDataDir: dir });
+    expect(settings.setActivePetId('petdex-cli:boba').ok).toBe(true);
+    expect(readSettingsSync(dir).activePetId).toBe('petdex-cli:boba');
   });
 
   test('get returns a copy', () => {

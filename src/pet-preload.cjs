@@ -18,6 +18,9 @@ contextBridge.exposeInMainWorld('petBridge', {
   hover: () => send('pet:hover'),
   contextMenu: () => send('pet:contextMenu'),
   bubbleClick: () => send('pet:bubbleClick'),
+  // Bubble buttons / click panel (round 3): main validates the id.
+  bubbleAction: (id) => send('pet:bubbleAction', { id: String(id) }),
+  panelAction: (id) => send('pet:panelAction', { id: String(id) }),
   onRender: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on('pet:render', listener);

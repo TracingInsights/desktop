@@ -237,6 +237,50 @@ describe.skipIf(!unix)('native pet over a real socket (Node stub)', () => {
     expect(lines()).toEqual([]);
   });
 
+  test('concurrent starts (refresh adopt + promote) share one handshake', async () => {
+    const owner = setup();
+    await owner.pet.start();
+    owner.pet.detach();
+    const pet = createNativePet({ ...owner.deps });
+    const [adopt, promote] = await Promise.all([
+      pet.start({ allowSpawn: false, takeOver: false }),
+      pet.start()
+    ]);
+    expect(adopt).toEqual({ ok: true, reason: null });
+    expect(promote).toEqual({ ok: true, reason: null });
+    await wait(100);
+    const hellos = owner.lines().filter((l) => l.kind === 'hello');
+    // The owner's hello, then exactly one for both starts.
+    expect(hellos).toHaveLength(2);
+    expect(readFileSync(pet.tokenPath, 'utf8').trim()).toBe(hellos[1].token);
+    // The promote took the pet over (its replay).
+    expect(owner.lines().at(-1).kind).toBe('hide');
+    await pet.quit();
+  });
+
+  test('a quit during a crash respawn leaves the respawned pet alone', async () => {
+    const { deps, calls, lines } = setup();
+    let quitOnSpawn = false;
+    // The respawn's spawn: Quit arrives while it is still connecting.
+    const pet = createNativePet({
+      ...deps,
+      spawn: (...args) => {
+        if (quitOnSpawn) void pet.quit();
+        return deps.spawn(...args);
+      }
+    });
+    await pet.start();
+    quitOnSpawn = true;
+    process.kill(pids.at(-1), 'SIGKILL');
+    await until(() => calls.spawns === 2);
+    await until(() => lines().filter((l) => l.kind === 'hello').length === 2);
+    await wait(150);
+    expect(pet.connected()).toBe(false);
+    expect(calls.failures).toEqual([]);
+    // The respawned pet got a hello and nothing after it (no replay).
+    expect(lines().at(-1).kind).toBe('hello');
+  });
+
   test('a socket other users could open is refused', async () => {
     const { pet, deps } = setup();
     await pet.start();
@@ -431,5 +475,121 @@ describe.skipIf(!unix)('pipe-server pid check over a real socket', () => {
     const owner = createNativePet({ ...first.deps });
     expect((await owner.start({ allowSpawn: false })).ok).toBe(true);
     await owner.quit();
+  });
+});
+
+describe.skipIf(!unix)('round 3: caps, button events, walks (L6)', () => {
+  const ROUND3_CAPS = [
+    'duo',
+    'bubble',
+    'menu',
+    'timeline',
+    'motion',
+    'sleep',
+    'bubble-actions',
+    'panel',
+    'badge',
+    'second-anim',
+    'v2-rows',
+    'timeline-v2'
+  ].join(',');
+  const LOOK = {
+    ...PAYLOAD,
+    state: 'look-a',
+    row: 9,
+    frames: 8,
+    durationMs: 1120,
+    once: true,
+    playKey: 'look:1',
+    atlas: { ...PAYLOAD.atlas, rows: 11 },
+    motion: 'roam',
+    sleeping: false,
+    bubbleActions: [{ id: 'ok', label: 'OK' }],
+    panel: { lines: ['x'], actions: [{ id: 'ask', label: 'Ask F1' }] },
+    badge: { kind: 'answer', label: 'Answer ready' }
+  };
+  const renders = (lines) =>
+    lines()
+      .filter((l) => l.kind === 'render')
+      .map((l) => l.payload);
+
+  test('an old pet (caps duo): today’s render, look → idle; can() false', async () => {
+    const { pet, lines } = setup();
+    await pet.start();
+    expect(pet.caps()).toEqual(['duo']);
+    expect(pet.can('panel')).toBe(false);
+    expect(pet.can('badge')).toBe(false);
+    pet.show({ size: 'm', duo: false });
+    pet.render(LOOK);
+    await until(() => renders(lines).length > 0);
+    const got = renders(lines)[0];
+    expect(got).toMatchObject({ state: 'idle', row: 0, playKey: 'idle' });
+    for (const key of [
+      'motion',
+      'sleeping',
+      'bubbleActions',
+      'panel',
+      'badge',
+      'secondAnim'
+    ]) {
+      expect(got).not.toHaveProperty(key);
+    }
+    await pet.quit();
+  });
+
+  test('a round-3 pet: every field, the look itself; can(panel / badge) true', async () => {
+    const { pet, lines } = setup({ env: { STUB_CAPS: ROUND3_CAPS } });
+    await pet.start();
+    expect(pet.can('panel')).toBe(true);
+    expect(pet.can('badge')).toBe(true);
+    // Only round-3 cap names count as features.
+    expect(pet.can('duo')).toBe(false);
+    pet.show({ size: 'm', duo: false });
+    pet.render(LOOK);
+    await until(() => renders(lines).length > 0);
+    expect(renders(lines)[0]).toMatchObject({
+      state: 'look-a',
+      row: 9,
+      motion: 'roam',
+      sleeping: false,
+      bubbleActions: [{ id: 'ok', label: 'OK' }],
+      panel: LOOK.panel,
+      badge: LOOK.badge,
+      secondAnim: null
+    });
+    await pet.quit();
+  });
+
+  test('button events reach onEvent with their id; a walk’s end is saved at once', async () => {
+    const { pet, calls } = setup({
+      env: { STUB_CAPS: ROUND3_CAPS, STUB_ROUND3: '1' }
+    });
+    await pet.start();
+    await until(() => calls.events.length >= 2 && calls.saved.length >= 1);
+    expect(calls.events).toEqual([
+      ['bubbleAction', 'mute'],
+      ['panelAction', 'close']
+    ]);
+    expect(calls.saved).toEqual([{ x: 300, y: 60, displayId: 'd2' }]);
+    await pet.quit();
+  });
+
+  test('after a respawn the last payload is sent for the new pet’s caps', async () => {
+    const { pet, lines, deps } = setup();
+    await pet.start();
+    pet.show({ size: 'm', duo: false });
+    pet.render(LOOK);
+    await until(() => renders(lines).length > 0);
+    expect(renders(lines)[0].state).toBe('idle');
+    // The pet dies; the one spawned in its place is a round-3 build.
+    deps.env.STUB_CAPS = ROUND3_CAPS;
+    process.kill(pet.peer().pid, 'SIGKILL');
+    await until(() => renders(lines).length > 1, 5000);
+    expect(renders(lines)[1]).toMatchObject({
+      state: 'look-a',
+      motion: 'roam'
+    });
+    expect(pet.can('panel')).toBe(true);
+    await pet.quit();
   });
 });

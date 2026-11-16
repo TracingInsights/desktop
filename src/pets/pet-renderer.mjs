@@ -28,7 +28,8 @@ import { join } from 'node:path';
  *   savePosition: () => void,
  *   secondSide?: () => 'left'|'right',
  *   groupRect?: () => object|null,
- *   window?: () => any
+ *   window?: () => any,
+ *   can?: (feature: string) => boolean
  * }} PetWindowLike
  */
 
@@ -145,6 +146,18 @@ export function createPetRenderer(deps) {
     /** @returns {'left'|'right'} */
     secondSide: () => impl?.secondSide?.() ?? 'left',
     groupRect: () => impl?.groupRect?.() ?? null,
+    /**
+     * Does the pet in use draw a round-3 feature ('panel', 'badge')? The
+     * Electron window does; the native pet only when it says so (`can`,
+     * from its `ready.caps`); nothing while the choice is pending.
+     * @param {string} feature
+     */
+    can: (feature) =>
+      kind === 'electron'
+        ? (electronWindow.can?.(feature) ?? true)
+        : kind === 'native'
+          ? Boolean(native?.can?.(feature))
+          : false,
     /** The Electron pet's BrowserWindow (sender checks, context menu), else null. */
     window: () =>
       kind === 'electron' ? (electronWindow.window?.() ?? null) : null

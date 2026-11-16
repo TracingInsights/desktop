@@ -14,17 +14,29 @@
  * when `canStartMoment()` says the pet is free, and its marker
  * (`lastResultKey` / `lastRateKey` / `lastFactDay`) is saved as it starts,
  * so a restart never repeats it. Every bubble's click target stays here in
- * main — the pet page only gets the text.
+ * main — the pet page only gets the text. Round 3: the race-weekend
+ * greeting (greeting.mjs) works the same way, once per local day part
+ * (marker `lastGreetingKey`).
+ *
+ * Round 3 (L4): bubbles carry buttons (`bubbleActions`, bubble-actions.mjs);
+ * a click on the pet toggles the click panel (`panel`, panel.mjs) in place
+ * of the bubble — never during a drag, and no once-only moment starts while
+ * it is open; an Ask-window `done` while that window is in the background
+ * sets the "Answer ready" `badge`, and the next click on the pet opens the
+ * Ask window instead of the panel. Panel and badge only when the renderer
+ * draws them (`petWindow.can`).
  *
  * Electron-free: the pet window, settings, store, schedule feed and facts
  * are injected.
  */
 import {
+  ANSWER_BADGE,
   BUBBLE_MS,
   CELEBRATE_KINDS,
   CELEBRATE_TEXT_CHARS,
   CHAT_SIGNALS,
   DAILY_FACT_HOUR,
+  PANEL_CLOSE_ID,
   PET_SIZES,
   PET_STATES,
   SESSION_DURATION_MS
@@ -33,7 +45,9 @@ import {
   CALENDAR_TARGET,
   canStartMoment,
   computeBehaviour,
+  duoDrivers,
   duoHeadToHead,
+  duoResultPoses,
   HOVER_BUBBLE_MS,
   nextRateNudgeAt,
   rateMoment,
@@ -41,7 +55,14 @@ import {
 } from './behaviour.mjs';
 import { countdownText } from './schedule.mjs';
 import { localDayKey, localHour, nextLocalHourAt } from './facts.mjs';
+import {
+  greetingKey,
+  greetingMoment,
+  nextGreetingCheckAt
+} from './greeting.mjs';
 import { petAssetUrl } from './protocols.mjs';
+import { bubbleActionsFor, MUTE_ACTIONS } from './bubble-actions.mjs';
+import { buildPanel } from './panel.mjs';
 
 /** Longest single timer; the controller re-plans after it. */
 export const MAX_TIMER_MS = 6 * 60 * 60 * 1000;
@@ -62,7 +83,8 @@ const CELEBRATIONS = Object.freeze({
 export const MOMENT_RULES = Object.freeze({
   result: { toggle: 'resultReactions', marker: 'lastResultKey' },
   rate: { toggle: 'rateNudge', marker: 'lastRateKey' },
-  fact: { toggle: 'dailyFact', marker: 'lastFactDay' }
+  fact: { toggle: 'dailyFact', marker: 'lastFactDay' },
+  greeting: { toggle: 'greetings', marker: 'lastGreetingKey' }
 });
 
 /**
@@ -89,12 +111,49 @@ const STATE_BY_ID = new Map(PET_STATES.map((s) => [s.id, s]));
 const onceDurationMs = (kind) =>
   STATE_BY_ID.get(kind === 'click' ? 'jumping' : 'waving')?.durationMs ?? 0;
 
+/** The idle loop, for a sprite whose atlas lacks the wanted row. */
+const IDLE_POSE = Object.freeze({
+  state: 'idle',
+  once: false,
+  playKey: 'idle',
+  delayMs: 0
+});
+
+/**
+ * The duo's second sprite in the render payload (4b): its own pose from the
+ * behaviour, or null = it plays the first's animation (as before). A state
+ * whose row the second atlas lacks (`row >= rows`, e.g. a v2-only row on a
+ * v1 pet) plays `idle` on that sprite instead.
+ * @param {{ still: boolean, second?: import('./behaviour.mjs').SecondPose|null }} out
+ * @param {{ row: number }} firstAnim the first sprite's PET_STATES entry
+ * @param {number} secondRows the second atlas's row count
+ * @returns {null | { state: string, row: number, frames: number, durationMs: number, once: boolean, still: boolean, playKey: string, delayMs: number }}
+ */
+export function secondAnimation(out, firstAnim, secondRows) {
+  const fits = (anim) => !Number.isFinite(secondRows) || anim.row < secondRows;
+  const own = out.second ? STATE_BY_ID.get(out.second.state) : null;
+  if (!own && fits(firstAnim)) return null;
+  const pose = own && fits(own) ? out.second : IDLE_POSE;
+  const anim = STATE_BY_ID.get(pose.state);
+  return {
+    state: anim.id,
+    row: anim.row,
+    frames: anim.frames,
+    durationMs: anim.durationMs,
+    once: Boolean(pose.once),
+    still: Boolean(out.still),
+    playKey: String(pose.playKey),
+    delayMs: Math.max(0, Number(pose.delayMs) || 0)
+  };
+}
+
 /**
  * @param {{
  *   settings: {
  *     get: () => { enabled: boolean, activePetId: string|null, size: 's'|'m'|'l', chatReactions: boolean, sessionReactions: 'calm'|'lively'|'off', quietUntil: string|null },
  *     setQuietUntil: (iso: string|null) => { ok: boolean, error?: string },
- *     setMarker?: (name: 'lastResultKey'|'lastRateKey'|'lastFactDay', value: string) => { ok: boolean, error?: string }
+ *     setMarker?: (name: 'lastResultKey'|'lastRateKey'|'lastFactDay'|'lastGreetingKey', value: string) => { ok: boolean, error?: string },
+ *     update?: (patch: Record<string, unknown>) => { ok: boolean, error?: string }
  *   },
  *   store: { get: (id: string) => ({ atlas: { rows: number, scale: number }, imagePath?: string } | null) },
  *   getSessions: () => readonly object[],
@@ -109,12 +168,17 @@ const onceDurationMs = (kind) =>
  *     render: (payload: object) => void,
  *     moveBy: (dx: number, dy: number) => void,
  *     savePosition: () => void,
- *     secondSide?: () => 'left'|'right'
+ *     secondSide?: () => 'left'|'right',
+ *     can?: (feature: 'panel'|'badge') => boolean
  *   },
  *   support: () => { supported: boolean, needsRestartForPets: boolean },
  *   openMain: (path?: string) => void,
+ *   openAsk?: () => void,
+ *   askInBackground?: () => boolean,
  *   showContextMenu?: () => void,
  *   now?: () => number,
+ *   locale?: string,
+ *   timeZone?: string,
  *   setTimeout?: typeof globalThis.setTimeout,
  *   clearTimeout?: typeof globalThis.clearTimeout,
  *   onError?: (error: unknown) => void
@@ -139,8 +203,13 @@ export function createPetController(deps) {
     petWindow,
     support,
     openMain,
+    openAsk = () => {},
+    askInBackground = () => false,
     showContextMenu = () => {},
     now = Date.now,
+    // Greeting times: the runtime's locale / time zone unless given (tests).
+    locale = undefined,
+    timeZone = undefined,
     setTimeout: setTimer = globalThis.setTimeout,
     clearTimeout: clearTimer = globalThis.clearTimeout,
     onError = (error) => console.warn('[pets] controller:', error)
@@ -151,13 +220,15 @@ export function createPetController(deps) {
   /** @type {null | { signal: string, atMs: number }} */
   let chat = null;
   let lastActivityAtMs = now();
+  /** Last pet-window input (roaming waits ROAM_AFTER_INPUT_MS after it); null = none. */
+  let lastInteractionAtMs = null;
   let onBattery = false;
   let locked = false;
   let osReducedMotion = false;
   let pageReducedMotion = false;
   /** Bubbles the user clicked away (newest last, capped). */
   const dismissedBubbleKeys = new Set();
-  /** @type {null | { key: string, target: string }} */
+  /** @type {null | { key: string, target: string, kind: string }} */
   let currentBubble = null;
   /** @type {null | { atMs: number, text: string, target: string }} */
   let hoverBubble = null;
@@ -174,7 +245,8 @@ export function createPetController(deps) {
   const usedMarkers = {
     lastResultKey: null,
     lastRateKey: null,
-    lastFactDay: null
+    lastFactDay: null,
+    lastGreetingKey: null
   };
   let timer = null;
   /** Ends a drag whose release never arrived (X11 can drop it, see DRAG_IDLE_MS). */
@@ -188,6 +260,17 @@ export function createPetController(deps) {
   let lastRender = null;
   /** Sprite URL cache-buster, bumped when installed pets change. */
   let assetVersion = 0;
+  /** Click panel (round 3, 3a): open from a click until closed again. */
+  let panelOpen = false;
+  /** The open panel's action targets (id → app path), kept in main. */
+  /** @type {Record<string, string>} */
+  let panelTargets = {};
+  /** "Answer ready" badge (round 3, 3b), or null. */
+  /** @type {null | { kind: string, label: string }} */
+  let badge = null;
+
+  /** Does the renderer draw this round-3 feature? (Fakes without `can`: yes.) */
+  const petCan = (feature) => petWindow.can?.(feature) ?? true;
 
   function endDrag() {
     if (dragTimer !== null) {
@@ -283,11 +366,70 @@ export function createPetController(deps) {
     }
   }
 
+  /**
+   * Duo reactions input (4b): only while a duo shows and both pets map to
+   * different drivers (like the head-to-head hover); `result` = the latest
+   * race's head-to-head poses, first sprite then second.
+   */
+  function duoInput(current) {
+    const feed = readFeed();
+    const drivers = duoDrivers({
+      feed,
+      firstPetId: current.activePetId,
+      secondPetId: current.secondPetId
+    });
+    if (!drivers || !secondPet(current)) return null;
+    return {
+      result: duoResultPoses({
+        feed,
+        firstDriverId: drivers.first,
+        secondDriverId: drivers.second
+      })
+    };
+  }
+
+  /**
+   * A result bubble adds the duo's season head-to-head (the hover line,
+   * names in sprite order) while two mapped pets show (4b).
+   * @param {Omit<import('./behaviour.mjs').Moment, 'atMs'>} next @param {any} current
+   */
+  function withDuoHeadToHead(next, current) {
+    if (!secondPet(current)) return next;
+    const duo = duoHeadToHead({
+      feed: readFeed(),
+      firstPetId: current.activePetId,
+      secondPetId: current.secondPetId,
+      secondSide: petWindow.secondSide?.() ?? 'left'
+    });
+    return duo ? { ...next, text: `${next.text} · ${duo.text}` } : next;
+  }
+
   const markerUsed = (current, name, value) =>
     current[name] === value || usedMarkers[name] === value;
 
   /**
-   * The once-only moment that may start now, if any (result > rate > fact).
+   * The race-weekend greeting that may start now (greeting.mjs), if any.
+   * @param {number} nowMs @param {any} current @param {import('./behaviour.mjs').Behaviour} out
+   */
+  function nextGreeting(nowMs, current, out) {
+    if (!current.greetings || !canStartMoment('greeting', out)) return null;
+    try {
+      const key = greetingKey(nowMs, timeZone);
+      if (!key || markerUsed(current, 'lastGreetingKey', key)) return null;
+      return greetingMoment({
+        sessions: getSessions() ?? [],
+        nowMs,
+        locale,
+        timeZone
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The once-only moment that may start now, if any (result > greeting >
+   * rate > fact).
    * @param {number} nowMs @param {any} current @param {import('./behaviour.mjs').Behaviour} out
    */
   function nextMoment(nowMs, current, out) {
@@ -299,8 +441,12 @@ export function createPetController(deps) {
         favoriteDriverId: current.favoriteDriverId,
         nowMs
       });
-      if (next && !markerUsed(current, 'lastResultKey', next.key)) return next;
+      if (next && !markerUsed(current, 'lastResultKey', next.key)) {
+        return withDuoHeadToHead(next, current);
+      }
     }
+    const greeting = nextGreeting(nowMs, current, out);
+    if (greeting) return greeting;
     if (current.rateNudge && canStartMoment('rate', out)) {
       const next = rateMoment({ feed, nowMs });
       if (next && !markerUsed(current, 'lastRateKey', next.key)) return next;
@@ -341,7 +487,7 @@ export function createPetController(deps) {
     }
   }
 
-  /** Next wake-up the behaviour itself cannot see (rate nudge / fact hour). */
+  /** Next wake-up the behaviour itself cannot see (rate nudge / fact hour / greeting day part). */
   function companionWakeAt(nowMs, current) {
     const times = [];
     if (current.rateNudge) {
@@ -351,6 +497,22 @@ export function createPetController(deps) {
     if (current.dailyFact && facts) {
       times.push(nextLocalHourAt(nowMs, DAILY_FACT_HOUR));
     }
+    if (current.greetings) {
+      try {
+        const check = nextGreetingCheckAt({
+          sessions: getSessions() ?? [],
+          nowMs,
+          timeZone
+        });
+        if (check !== null) times.push(check);
+      } catch {
+        // No schedule (or a bad time zone): the next refresh looks again.
+      }
+      // A live session holds the greeting back: look again when it ends
+      // (the calendar's own boundaries are gone with sessionReactions off).
+      const sessionEnd = currentSessionEndMs();
+      if (sessionEnd !== null) times.push(sessionEnd);
+    }
     if (moment === null && Number.isFinite(lastMomentEndAt)) {
       const gapEnd = lastMomentEndAt + MOMENT_GAP_MS;
       if (gapEnd > nowMs) times.push(gapEnd);
@@ -358,9 +520,12 @@ export function createPetController(deps) {
     return times.length > 0 ? Math.min(...times) : Infinity;
   }
 
-  function behaviourInput(nowMs, current, quietMs) {
+  /** @param {{ atlas: { rows: number } }} pet the first (shown) pet */
+  function behaviourInput(nowMs, current, quietMs, pet) {
     return {
       nowMs,
+      // v2 sheets (11 rows) unlock the look-around states (behaviour.mjs).
+      atlasRows: pet.atlas.rows,
       interaction,
       hoverBubble,
       reducedMotion: osReducedMotion || pageReducedMotion,
@@ -368,9 +533,12 @@ export function createPetController(deps) {
       chatReactions: current.chatReactions,
       chat,
       sessionReactions: current.sessionReactions,
+      roam: current.roam === true,
+      lastInteractionAtMs,
       calendar: calendarInput(nowMs, current),
       celebration,
       moment,
+      duo: duoInput(current),
       dismissedBubbleKeys,
       lastActivityAtMs,
       onBattery,
@@ -397,6 +565,7 @@ export function createPetController(deps) {
       hoverBubble = null;
       celebration = null;
       currentBubble = null;
+      panelOpen = false;
       plan(quietMs !== null && quietMs > nowMs ? quietMs : NaN);
       return;
     }
@@ -421,18 +590,28 @@ export function createPetController(deps) {
     }
 
     const quietNow = quietMs !== null && quietMs > nowMs;
-    let out = computeBehaviour(behaviourInput(nowMs, current, quietMs));
-    if (!moment && !quietNow && !locked) {
+    // A renderer that cannot draw the panel (an older native pet) never keeps one open.
+    if (panelOpen && !petCan('panel')) panelOpen = false;
+    let out = computeBehaviour(behaviourInput(nowMs, current, quietMs, pet));
+    // The open panel hides bubbles: a once-only moment waits until it closes.
+    if (!moment && !quietNow && !locked && !panelOpen) {
       const next = nextMoment(nowMs, current, out);
       if (next) {
         moment = { ...next, atMs: nowMs };
         useMarker(moment);
-        out = computeBehaviour(behaviourInput(nowMs, current, quietMs));
+        out = computeBehaviour(behaviourInput(nowMs, current, quietMs, pet));
       }
     }
-    currentBubble = out.bubble
-      ? { key: out.bubble.key, target: out.bubble.target }
-      : null;
+    // The panel replaces the bubble while it is open.
+    currentBubble =
+      out.bubble && !panelOpen
+        ? {
+            key: out.bubble.key,
+            target: out.bubble.target,
+            kind: out.bubble.kind
+          }
+        : null;
+    const panel = panelOpen ? buildPanelNow(nowMs, current) : null;
     const second = secondPet(current);
     const anim = STATE_BY_ID.get(out.state) ?? STATE_BY_ID.get('idle');
     const payload = {
@@ -442,8 +621,12 @@ export function createPetController(deps) {
       durationMs: anim.durationMs,
       once: out.once,
       still: out.still,
+      sleeping: out.sleeping,
       playKey: out.playKey,
-      bubble: out.bubble?.text ?? null,
+      // Round 3 (2a): the pet window walks while this is set (roam.mjs) —
+      // never while the panel is open (3a): it would carry the panel off.
+      motion: panelOpen ? null : (out.motion ?? null),
+      bubble: currentBubble ? out.bubble.text : null,
       size: Object.hasOwn(PET_SIZES, current.size) ? current.size : 'm',
       atlas: {
         url: petAssetUrl(current.activePetId, assetVersion),
@@ -456,7 +639,15 @@ export function createPetController(deps) {
             rows: second.atlas.rows,
             scale: second.atlas.scale
           }
-        : null
+        : null,
+      secondAnim: second ? secondAnimation(out, anim, second.atlas.rows) : null,
+      bubbleActions: currentBubble
+        ? bubbleActionsFor(currentBubble.kind, {
+            sessionQuiet: currentSessionEndMs() !== null
+          })
+        : null,
+      panel: panel ? { lines: panel.lines, actions: panel.actions } : null,
+      badge: badge && petCan('badge') ? { ...badge } : null
     };
     const json = JSON.stringify(payload);
     if (json !== lastRenderJson) {
@@ -466,7 +657,8 @@ export function createPetController(deps) {
     }
     const wakeAt = Math.min(
       out.nextChangeAt ?? Infinity,
-      companionWakeAt(nowMs, current)
+      companionWakeAt(nowMs, current),
+      panel?.changesAt ?? Infinity
     );
     plan(Number.isFinite(wakeAt) ? wakeAt : NaN);
   }
@@ -496,7 +688,7 @@ export function createPetController(deps) {
     lastActivityAtMs = now();
   }
 
-  return {
+  const api = {
     start() {
       started = true;
       touch();
@@ -511,10 +703,11 @@ export function createPetController(deps) {
     /** Last payload pushed to the pet window (tests, diagnostics). */
     lastRender: () => lastRender,
     /**
-     * The bubble showing now: its key, click target and — for a once-only
-     * moment — the marker it saved (the native timeline reports which
-     * moments the user really saw, docs/DESKTOP_PETS_NATIVE_PLAN.md §4.2).
-     * @returns {null | { key: string, target: string, marker: null | { name: string, value: string } }}
+     * The bubble showing now: its key, kind (BUBBLE_KINDS), click target
+     * and — for a once-only moment — the marker it saved (the native
+     * timeline reports which moments the user really saw, and mutes a kind
+     * offline, docs/DESKTOP_PETS_NATIVE_PLAN.md §4.2).
+     * @returns {null | { key: string, kind: string, target: string, marker: null | { name: string, value: string } }}
      */
     currentBubble() {
       if (!currentBubble) return null;
@@ -522,6 +715,7 @@ export function createPetController(deps) {
         moment !== null && currentBubble.key === `${moment.kind}:${moment.key}`;
       return {
         key: currentBubble.key,
+        kind: currentBubble.kind,
         target: currentBubble.target,
         marker: isMoment
           ? { name: MOMENT_RULES[moment.kind].marker, value: moment.key }
@@ -531,10 +725,13 @@ export function createPetController(deps) {
 
     /**
      * Pet-window events (already sender-checked and validated by ipc.mjs).
-     * @param {'ready'|'drag'|'dragEnd'|'click'|'dblclick'|'hover'|'contextMenu'|'bubbleClick'} kind
+     * `bubbleAction` / `panelAction` take the button id.
+     * @param {'ready'|'drag'|'dragEnd'|'click'|'dblclick'|'hover'|'contextMenu'|'bubbleClick'|'bubbleAction'|'panelAction'} kind
      * @param {...any} args
      */
     petEvent(kind, ...args) {
+      // Any pet input stops a walk; roaming resumes ROAM_AFTER_INPUT_MS later.
+      if (kind !== 'ready') lastInteractionAtMs = now();
       switch (kind) {
         case 'ready': {
           pageReducedMotion = Boolean(args[0]?.reducedMotion);
@@ -563,8 +760,11 @@ export function createPetController(deps) {
           break;
         }
         case 'click': {
+          const dragging = interaction?.kind === 'drag';
           interaction = { kind: 'click', atMs: now() };
           touch();
+          // A drag never opens the panel.
+          if (!dragging) clickPanelOrBadge();
           break;
         }
         case 'hover': {
@@ -597,7 +797,18 @@ export function createPetController(deps) {
         case 'contextMenu': {
           touch();
           showContextMenu();
-          return;
+          // Re-render: a walking pet stops under the menu.
+          break;
+        }
+        case 'bubbleAction': {
+          touch();
+          bubbleAction(args[0]);
+          break;
+        }
+        case 'panelAction': {
+          touch();
+          panelAction(args[0]);
+          break;
         }
         default:
           return;
@@ -606,13 +817,17 @@ export function createPetController(deps) {
     },
 
     /**
-     * Chat activity from the page (`pets:signal`).
+     * Chat activity from the page (`pets:signal`). `from` = the window that
+     * sent it ('ask' = the quick-ask window): its `done` while that window
+     * is in the background shows the "Answer ready" badge.
      * @param {string} signal one of CHAT_SIGNALS
+     * @param {'ask'|'main'|null} [from]
      */
-    signal(signal) {
+    signal(signal, from = null) {
       if (!CHAT_SIGNALS.includes(signal))
         return { ok: false, error: 'Unknown signal.' };
       chat = signal === 'idle' ? null : { signal, atMs: now() };
+      if (signal === 'done' && from === 'ask') noteAskAnswer();
       touch();
       refresh();
       return { ok: true };
@@ -713,13 +928,23 @@ export function createPetController(deps) {
       refresh();
     },
 
-    /** Main-window focus etc. counts as activity for the ambient timer. */
+    /** Main-window focus etc. counts as activity for the ambient timer (and wakes a sleeping pet). */
     noteActivity() {
-      const wasWaiting = lastRender?.state === 'waiting' && !chat;
+      const wasWaiting =
+        (lastRender?.state === 'waiting' && !chat) ||
+        lastRender?.sleeping === true;
       touch();
       if (wasWaiting) refresh();
+    },
+
+    /** The Ask window was opened or focused: its answer has been seen. */
+    clearBadge() {
+      if (!badge) return;
+      badge = null;
+      refresh();
     }
   };
+  return api;
 
   function currentSessionEndMs() {
     const nowMs = now();
@@ -749,6 +974,96 @@ export function createPetController(deps) {
       lastMomentEndAt = now();
       moment = null;
     }
+  }
+
+  // --- Round 3 (L4): bubble buttons, click panel, answer badge ---
+
+  /** The panel for now (lines, actions, targets kept here). */
+  function buildPanelNow(nowMs, current) {
+    let sessions;
+    try {
+      sessions = getSessions() ?? [];
+    } catch {
+      sessions = [];
+    }
+    const built = buildPanel({
+      sessions,
+      feed: readFeed(),
+      favoriteDriverId: current.favoriteDriverId ?? null,
+      nowMs
+    });
+    panelTargets = built.targets;
+    return built;
+  }
+
+  function openAskWindow() {
+    try {
+      openAsk();
+    } catch (error) {
+      onError(error);
+    }
+  }
+
+  /** A click on the pet: the waiting answer first, else toggle the panel. */
+  function clickPanelOrBadge() {
+    if (badge && petCan('badge')) {
+      badge = null;
+      panelOpen = false;
+      openAskWindow();
+      return;
+    }
+    panelOpen = !panelOpen && petCan('panel');
+  }
+
+  /** @param {unknown} id a BUBBLE_ACTION_IDS id (ipc.mjs validated it) */
+  function bubbleAction(id) {
+    const shown = currentBubble;
+    if (!shown) return;
+    const offered = bubbleActionsFor(shown.kind, {
+      sessionQuiet: currentSessionEndMs() !== null
+    });
+    if (!offered?.some((action) => action.id === id)) return;
+    // Every button puts this bubble away; none opens a window.
+    dismissBubble(shown.key);
+    if (id === 'quiet-1h') api.quiet('1h');
+    else if (id === 'quiet-session') api.quiet('session');
+    else if (id === 'mute' && Object.hasOwn(MUTE_ACTIONS, shown.kind)) {
+      // The page path: only page-writable keys, so the gallery follows it.
+      try {
+        settings.update?.({ ...MUTE_ACTIONS[shown.kind].patch });
+      } catch (error) {
+        onError(error);
+      }
+    }
+  }
+
+  /** @param {unknown} id a PANEL_ACTION_IDS id or PANEL_CLOSE_ID */
+  function panelAction(id) {
+    if (!panelOpen) return;
+    if (id === PANEL_CLOSE_ID) {
+      panelOpen = false;
+      return;
+    }
+    if (typeof id !== 'string' || !Object.hasOwn(panelTargets, id)) return;
+    panelOpen = false;
+    if (id === 'ask') {
+      badge = null;
+      openAskWindow();
+    } else {
+      openMain(panelTargets[id]);
+    }
+  }
+
+  /** An Ask-window answer arrived: badge it unless that window is in front. */
+  function noteAskAnswer() {
+    if (settings.get().chatReactions === false) return;
+    let background;
+    try {
+      background = Boolean(askInBackground());
+    } catch {
+      background = false;
+    }
+    if (background) badge = ANSWER_BADGE;
   }
 
   /**

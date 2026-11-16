@@ -109,7 +109,59 @@ export function createXaiAuth(deps = {}) {
     now = () => Date.now()
   } = deps;
 
+  // A fresh object per device flow, so a poll answered after a newer start
+  // (or after disconnect) can tell it is stale.
   let pendingDevice = null;
+  /** Bumped by every start and by disconnect. */
+  let flows = 0;
+  /** The token refresh in flight (parallel calls share it). */
+  let refreshing = null;
+
+  /** The stored credential is still the one this refresh started from. */
+  const stillStored = (credential) =>
+    credentialStore.load('xai-oauth')?.refreshToken === credential.refreshToken;
+
+  async function refreshCredential(credential) {
+    const body = new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: XAI_OAUTH_CLIENT_ID,
+      refresh_token: credential.refreshToken
+    });
+    const response = await fetchImpl(TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        accept: 'application/json'
+      },
+      body
+    });
+    if (!response.ok) {
+      if (response.status === 400 || response.status === 401) {
+        // Not a credential the user connected again meanwhile.
+        if (stillStored(credential)) credentialStore.delete('xai-oauth');
+        return inferenceError('auth_expired', {
+          providerMessage: 'xAI authorization expired. Reconnect.'
+        });
+      }
+      return inferenceError('http_error', {
+        status: response.status,
+        providerMessage: `xAI token refresh failed (HTTP ${response.status}).`
+      });
+    }
+    const refreshed = credentialFromTokens(
+      await response.json(),
+      credential.refreshToken
+    );
+    // Disconnected (or replaced) meanwhile: never save it back.
+    if (!stillStored(credential)) {
+      return inferenceError('auth_expired', {
+        providerMessage: 'xAI is not connected.'
+      });
+    }
+    refreshed.updatedAt = now();
+    credentialStore.save('xai-oauth', refreshed);
+    return { ok: true, credential: refreshed };
+  }
 
   return {
     async status() {
@@ -122,6 +174,7 @@ export function createXaiAuth(deps = {}) {
     },
 
     async startDeviceAuth() {
+      const flow = ++flows;
       const body = new URLSearchParams({
         client_id: XAI_OAUTH_CLIENT_ID,
         scope: XAI_OAUTH_SCOPE
@@ -141,6 +194,11 @@ export function createXaiAuth(deps = {}) {
         });
       }
       const payload = await response.json();
+      if (flow !== flows) {
+        return inferenceError('aborted', {
+          providerMessage: 'xAI sign-in was cancelled.'
+        });
+      }
       if (!payload.device_code || !payload.user_code) {
         return inferenceError('invalid_request', {
           providerMessage: 'xAI device-code response was missing a user code.'
@@ -163,7 +221,8 @@ export function createXaiAuth(deps = {}) {
     },
 
     async pollDeviceAuth() {
-      if (!pendingDevice) {
+      const device = pendingDevice;
+      if (!device) {
         return inferenceError('invalid_request', {
           providerMessage: 'No xAI device authorization in progress.'
         });
@@ -171,7 +230,7 @@ export function createXaiAuth(deps = {}) {
       const body = new URLSearchParams({
         grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
         client_id: XAI_OAUTH_CLIENT_ID,
-        device_code: pendingDevice.deviceCode
+        device_code: device.deviceCode
       });
       const response = await fetchImpl(TOKEN_URL, {
         method: 'POST',
@@ -182,6 +241,14 @@ export function createXaiAuth(deps = {}) {
         body
       });
       const payload = await readJson(response);
+      // A newer start or a disconnect while this poll was out: never save.
+      if (pendingDevice !== device) {
+        return {
+          ok: true,
+          status: 'expired',
+          message: 'xAI sign-in was cancelled.'
+        };
+      }
       if (response.ok) {
         const credential = credentialFromTokens(payload);
         credentialStore.save('xai-oauth', credential);
@@ -244,50 +311,24 @@ export function createXaiAuth(deps = {}) {
 
     async disconnect() {
       pendingDevice = null;
+      flows += 1;
       credentialStore.delete('xai-oauth');
     },
 
     async resolveCredential() {
-      let credential = credentialStore.load('xai-oauth');
+      const credential = credentialStore.load('xai-oauth');
       if (!credential) {
         return inferenceError('auth_expired', {
           providerMessage: 'xAI is not connected.'
         });
       }
-      if (shouldRefresh(credential)) {
-        const body = new URLSearchParams({
-          grant_type: 'refresh_token',
-          client_id: XAI_OAUTH_CLIENT_ID,
-          refresh_token: credential.refreshToken
-        });
-        const response = await fetchImpl(TOKEN_URL, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/x-www-form-urlencoded',
-            accept: 'application/json'
-          },
-          body
-        });
-        if (!response.ok) {
-          if (response.status === 400 || response.status === 401) {
-            credentialStore.delete('xai-oauth');
-            return inferenceError('auth_expired', {
-              providerMessage: 'xAI authorization expired. Reconnect.'
-            });
-          }
-          return inferenceError('http_error', {
-            status: response.status,
-            providerMessage: `xAI token refresh failed (HTTP ${response.status}).`
-          });
-        }
-        credential = credentialFromTokens(
-          await response.json(),
-          credential.refreshToken
-        );
-        credential.updatedAt = now();
-        credentialStore.save('xai-oauth', credential);
-      }
-      return { ok: true, credential };
+      if (!shouldRefresh(credential)) return { ok: true, credential };
+      // One refresh at a time: a second POST of the same refresh token would
+      // be rejected (rotation) and that 400 would delete the credential.
+      refreshing ??= refreshCredential(credential).finally(() => {
+        refreshing = null;
+      });
+      return refreshing;
     }
   };
 }

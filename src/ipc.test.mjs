@@ -1,7 +1,11 @@
 import { describe, test, expect } from 'bun:test';
-import { createHarnessIpc, isTrustedAppSender } from './ipc.mjs';
+import {
+  abortOnNavigation,
+  createHarnessIpc,
+  isTrustedAppSender
+} from './ipc.mjs';
 
-const appOrigin = 'https://app.tracinginsights.com';
+const appOrigin = 'https://tracinginsights.com';
 
 function senderEvent({ url, sender }) {
   return {
@@ -17,7 +21,7 @@ describe('isTrustedAppSender', () => {
     expect(
       isTrustedAppSender(
         senderEvent({
-          url: 'https://app.tracinginsights.com/chat',
+          url: 'https://tracinginsights.com/chat',
           sender: window.webContents,
           window
         }),
@@ -30,7 +34,7 @@ describe('isTrustedAppSender', () => {
     expect(
       isTrustedAppSender(
         senderEvent({
-          url: 'https://app.tracinginsights.com.evil.com',
+          url: 'https://tracinginsights.com.evil.com',
           sender: window.webContents,
           window
         }),
@@ -43,7 +47,7 @@ describe('isTrustedAppSender', () => {
     expect(
       isTrustedAppSender(
         senderEvent({
-          url: 'https://app.tracinginsights.com/chat',
+          url: 'https://tracinginsights.com/chat',
           sender: { id: 'other' },
           window
         }),
@@ -66,7 +70,7 @@ describe('isTrustedAppSender', () => {
     expect(
       isTrustedAppSender(
         senderEvent({
-          url: 'https://app.tracinginsights.com/chat',
+          url: 'https://tracinginsights.com/chat',
           sender: destroyed.webContents,
           window: destroyed
         }),
@@ -79,7 +83,7 @@ describe('isTrustedAppSender', () => {
 describe('isTrustedAppSender — further app windows (quick-ask)', () => {
   const main = { webContents: { id: 'main' }, isDestroyed: () => false };
   const ask = { webContents: { id: 'ask' }, isDestroyed: () => false };
-  const url = 'https://app.tracinginsights.com/desktop/ask';
+  const url = 'https://tracinginsights.com/desktop/ask';
 
   test('accepts an app-origin document in a listed window', () => {
     expect(
@@ -175,5 +179,52 @@ describe('createHarnessIpc abortSender', () => {
     expect(aborted).toEqual(['a1']);
     ipc.abortSender(main);
     expect(aborted).toEqual(['a1', 'm1']);
+  });
+});
+
+describe('abortOnNavigation', () => {
+  function setup() {
+    const handlers = new Map();
+    let aborts = 0;
+    abortOnNavigation({ on: (event, fn) => handlers.set(event, fn) }, () => {
+      aborts += 1;
+    });
+    const fire = (event, ...args) => handlers.get(event)({}, ...args);
+    return { fire, aborts: () => aborts };
+  }
+
+  test('replaceState on the same path (query / hash) keeps the stream', () => {
+    const { fire, aborts } = setup();
+    fire('did-navigate', 'https://app.example/ultra/2026/monza');
+    expect(aborts()).toBe(1);
+    fire(
+      'did-navigate-in-page',
+      'https://app.example/ultra/2026/monza?lap=12',
+      true
+    );
+    fire(
+      'did-navigate-in-page',
+      'https://app.example/ultra/2026/monza?lap=13#t',
+      true
+    );
+    expect(aborts()).toBe(1);
+  });
+
+  test('a client-side route change, a reload and destruction abort', () => {
+    const { fire, aborts } = setup();
+    fire('did-navigate', 'https://app.example/chat');
+    fire('did-navigate-in-page', 'https://app.example/stats', true);
+    expect(aborts()).toBe(2);
+    fire('did-navigate', 'https://app.example/stats');
+    expect(aborts()).toBe(3);
+    fire('destroyed');
+    expect(aborts()).toBe(4);
+  });
+
+  test('a subframe navigating in-page never aborts', () => {
+    const { fire, aborts } = setup();
+    fire('did-navigate', 'https://app.example/chat');
+    fire('did-navigate-in-page', 'https://frame.example/other', false);
+    expect(aborts()).toBe(1);
   });
 });

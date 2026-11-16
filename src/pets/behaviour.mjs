@@ -18,16 +18,26 @@
  *   7. calendar (sessionReactions ≠ off) — lead → waiting once + bubble,
  *      start → jumping once + bubble, during the session Calm → idle /
  *      Lively → running loop; bubbles hide after BUBBLE_MS
- *   8. ambient → idle; `waiting` loop after AMBIENT_WAITING_MS without input
+ *   8. ambient → idle; `waiting` loop after AMBIENT_WAITING_MS without input;
+ *      asleep after AMBIENT_SLEEP_MS (idle still frame + `sleeping`, the
+ *      renderers' "z z" mark; a bubble showing keeps it awake). While awake:
+ *      a mapped duo waves every DUO_WAVE_EVERY_MS (`duoWaveFirst`); with no
+ *      bubble, a Petdex v2 sheet (`atlasRows` ≥ 11) plays a `look-a` /
+ *      `look-b` one-shot every AMBIENT_LOOK_EVERY_MS (`ambientLook`)
  *
  * One bubble at a most, by BUBBLE_KINDS priority: hover (countdown / duo
- * head-to-head) > celebration > result > calendar moment > rate nudge >
- * daily fact. Each bubble carries its click target. The controller decides
- * when a once-only moment (result / rate / fact) starts — see
- * `canStartMoment()` — and feeds it back in as `moment`.
+ * head-to-head) > celebration > result > calendar moment > race-weekend
+ * greeting > rate nudge > daily fact. Each bubble carries its click target.
+ * The controller decides when a once-only moment (result / greeting / rate /
+ * fact) starts — see `canStartMoment()` — and feeds it back in as `moment`.
  *
  * On battery Lively is treated as Calm and the ambient pose is a still frame;
  * a locked screen stills everything.
+ *
+ * `motion` (round 3, 2a — `pickMotion()`) says whether the renderer may walk
+ * the window: 'roam' while ambient-idle (never asleep), 'dash' once at a
+ * session start, else null. The walking itself is the renderer's (roam.mjs).
+ * `second` (4b — `pickSecond()`) is a mapped duo's second sprite's own pose.
  */
 import {
   BUBBLE_MS,
@@ -42,6 +52,14 @@ import {
 
 /** Ambient: no pet / chat / window input for this long → `waiting` loop. */
 export const AMBIENT_WAITING_MS = 10 * 60 * 1000;
+/** Ambient: no input for this long → asleep (still frame + "z z"). */
+export const AMBIENT_SLEEP_MS = 30 * 60 * 1000;
+/** v2 sheets: a look-around one-shot this long after the last input, and every … */
+export const AMBIENT_LOOK_EVERY_MS = 4 * 60 * 1000;
+/** … again until the pet falls asleep (the last look starts at 28 min). */
+export const AMBIENT_LOOK_WINDOW_MS = AMBIENT_SLEEP_MS;
+/** The look-around states, alternating (rows 9 / 10 of an 8×11 sheet). */
+export const LOOK_STATES = Object.freeze(['look-a', 'look-b']);
 /** A hover bubble (countdown / duo head-to-head) stays this long. */
 export const HOVER_BUBBLE_MS = 6000;
 /** Bubble kinds, highest priority first (plan §12). */
@@ -50,11 +68,19 @@ export const BUBBLE_KINDS = Object.freeze([
   'celebrate',
   'result',
   'calendar',
+  'greeting',
   'rate',
   'fact'
 ]);
 /** Where a calendar-moment bubble leads (the home dashboard's schedule). */
 export const CALENDAR_TARGET = '/';
+/** Roaming (2a): no pet input for this long before the pet may wander. */
+export const ROAM_AFTER_INPUT_MS = 30 * 1000;
+/**
+ * The lights-out dash (2a) may run from the end of the start jump until the
+ * start bubble ends (this long after the session start).
+ */
+export const DASH_WINDOW_MS = BUBBLE_MS;
 
 const STATE_BY_ID = new Map(PET_STATES.map((s) => [s.id, s]));
 
@@ -82,7 +108,7 @@ const CHAT_STATES = Object.freeze({
  *   (kept apart from `interaction`, so a click does not cut it short).
  * @typedef {{ atMs: number, text: string, target: string }} Celebration
  * @typedef {{
- *   kind: 'result'|'rate'|'fact',
+ *   kind: 'result'|'greeting'|'rate'|'fact',
  *   key: string,
  *   text: string,
  *   target: string,
@@ -113,12 +139,19 @@ const CHAT_STATES = Object.freeze({
  *   calendar?: CalendarPhase|null,
  *   celebration?: Celebration|null,
  *   moment?: Moment|null,
+ *   duo?: DuoInput|null,
  *   dismissedBubbleKey?: string|null,
  *   dismissedBubbleKeys?: Iterable<string>|null,
  *   lastActivityAtMs?: number|null,
+ *   roam?: boolean,
+ *   lastInteractionAtMs?: number|null,
  *   onBattery?: boolean,
- *   locked?: boolean
+ *   locked?: boolean,
+ *   atlasRows?: number|null
  * }} BehaviourInput
+ *   `atlasRows` = the (first) pet's sheet rows: 11 enables the v2 states.
+ *   `roam` = the setting (2a); `lastInteractionAtMs` = the
+ *   last pet-window input (hover, click, drag, menu …), null = none yet.
  *
  * @typedef {'interaction'|'quiet'|'celebrate'|'chat'|'moment'|'calendar'|'ambient'} Layer
  *
@@ -128,13 +161,18 @@ const CHAT_STATES = Object.freeze({
  *   still: boolean,
  *   bubble: { key: string, kind: string, text: string, target: string } | null,
  *   playKey: string,
+ *   second: SecondPose|null,
  *   layer: Layer,
+ *   motion: null|'roam'|'dash',
+ *   sleeping: boolean,
  *   nextChangeAt: number|null
  * }} Behaviour
  *   `playKey` changes whenever a `once` animation must restart (two clicks in
  *   a row); `still` = show frame 0 without animating; `layer` = the rule
  *   that picked the pose (reduce motion keeps the underlying layer, so the
- *   controller can still tell an idle pet from a busy one).
+ *   controller can still tell an idle pet from a busy one). `second` = the
+ *   duo's second sprite's own pose (4b, see pickSecond), null = it plays the
+ *   first's; `sleeping` = the ambient layer's sleep (always with `still`).
  */
 
 /**
@@ -164,18 +202,29 @@ export function computeBehaviour(input) {
   // --- Bubble: one at a time, by priority; never while quiet ---
   const bubble = quiet ? null : pickBubble(input, { now, calendar, at });
 
-  const pick = pickState(input, { now, quiet, calendar, at });
+  const base = pickState(input, { now, quiet, calendar, at, bubble });
+  const pick =
+    (base.layer === 'ambient' &&
+      !bubble &&
+      !base.sleeping &&
+      ambientLook(input, now, at)) ||
+    base;
+  const motion = pickMotion(input, { now, quiet, calendar, bubble, pick, at });
   // Reduce motion keeps an interaction's pose but never animates it; every
   // other pose becomes the idle frame (the layer stays for the controller).
   const reduced = Boolean(input.reducedMotion) && pick.layer !== 'interaction';
   const still = Boolean(input.locked || input.reducedMotion || pick.still);
+  const second = reduced ? null : pickSecond(input, { now, at }, pick);
   return {
     state: reduced ? 'idle' : pick.state,
     once: reduced ? false : pick.once,
     still,
     bubble,
+    motion,
     playKey: reduced ? 'idle' : pick.playKey,
+    second,
     layer: pick.layer,
+    sleeping: pick.sleeping === true,
     nextChangeAt: boundaries.length > 0 ? Math.min(...boundaries) : null
   };
 }
@@ -279,10 +328,10 @@ function activeCalendar(calendar, now) {
 
 /**
  * @param {BehaviourInput} input
- * @param {{ now: number, quiet: boolean, calendar: ReturnType<typeof activeCalendar>, at: (ms: number) => void }} ctx
- * @returns {{ state: string, once: boolean, still: boolean, playKey: string, layer: Layer }}
+ * @param {{ now: number, quiet: boolean, calendar: ReturnType<typeof activeCalendar>, at: (ms: number) => void, bubble?: object|null }} ctx
+ * @returns {{ state: string, once: boolean, still: boolean, playKey: string, layer: Layer, sleeping?: boolean }}
  */
-function pickState(input, { now, quiet, calendar, at }) {
+function pickState(input, { now, quiet, calendar, at, bubble = null }) {
   // 1. Interaction.
   const interaction = input.interaction;
   if (interaction?.kind === 'drag') {
@@ -361,8 +410,8 @@ function pickState(input, { now, quiet, calendar, at }) {
     }
   }
 
-  // 6. Result moment's pose.
-  const moment = input.moment;
+  // 6. Result moment's pose (a duo's head-to-head pose replaces it, 4b).
+  const moment = momentWithDuoPose(input);
   if (moment?.state && STATE_BY_ID.has(moment.state) && now >= moment.atMs) {
     const until = moment.once
       ? moment.atMs + stateDurationMs(moment.state)
@@ -415,8 +464,24 @@ function pickState(input, { now, quiet, calendar, at }) {
     ? input.lastActivityAtMs
     : now;
   const waitingAt = lastActivity + AMBIENT_WAITING_MS;
+  const sleepAt = lastActivity + AMBIENT_SLEEP_MS;
   const still = Boolean(input.onBattery);
+  // Asleep: the idle row's still frame. A bubble (a moment, a calendar
+  // line) keeps the pet awake in `waiting` until it ends.
+  if (now >= sleepAt && !bubble) {
+    return {
+      state: 'idle',
+      once: false,
+      still: true,
+      playKey: 'sleeping',
+      layer: 'ambient',
+      sleeping: true
+    };
+  }
+  const wave = duoWaveFirst(input, now, lastActivity, at);
+  if (wave) return wave;
   if (now >= waitingAt) {
+    at(sleepAt);
     return {
       state: 'waiting',
       once: false,
@@ -435,13 +500,112 @@ function pickState(input, { now, quiet, calendar, at }) {
   };
 }
 
+/**
+ * The round-3 ambient extras (1b look-around, 2a roaming, 4b duo waves)
+ * need a pet that may move: not on battery, not locked, no reduce motion.
+ * @param {BehaviourInput} input
+ */
+const extrasAllowed = (input) =>
+  !input.onBattery && !input.locked && !input.reducedMotion;
+
+/**
+ * Ambient look-around on a Petdex v2 sheet (rows 9–10, SPEC 1b). The k-th
+ * look (k ≥ 1) starts k × AMBIENT_LOOK_EVERY_MS after the last input — the
+ * odd ones `look-a`, the even ones `look-b` — and plays once, while that is
+ * under AMBIENT_LOOK_WINDOW_MS after it. Deterministic from the clock, so a
+ * look a higher layer covered is simply skipped. Only over the ambient pose
+ * with no bubble (the caller checks both), with an 11-row atlas, and never
+ * on battery, locked or with reduce motion. Null = no look now; the next
+ * start / this look's end goes to `at`.
+ * @param {BehaviourInput} input
+ * @param {number} now
+ * @param {(ms: number) => void} at
+ * @returns {{ state: string, once: true, still: false, playKey: string, layer: 'ambient' } | null}
+ */
+function ambientLook(input, now, at) {
+  if (!extrasAllowed(input)) return null;
+  const states = LOOK_STATES.map((id) => STATE_BY_ID.get(id));
+  if (!states.every((s) => s && input.atlasRows >= s.minRows)) return null;
+  const last = Number.isFinite(input.lastActivityAtMs)
+    ? input.lastActivityAtMs
+    : now;
+  const stop = last + AMBIENT_LOOK_WINDOW_MS;
+  const k = Math.floor((now - last) / AMBIENT_LOOK_EVERY_MS);
+  if (k >= 1) {
+    const look = states[(k - 1) % 2];
+    const startMs = last + k * AMBIENT_LOOK_EVERY_MS;
+    const until = startMs + look.durationMs;
+    if (startMs < stop && now < until) {
+      at(until);
+      return {
+        state: look.id,
+        once: true,
+        still: false,
+        playKey: `look:${startMs}`,
+        layer: 'ambient'
+      };
+    }
+  }
+  const next = last + (k + 1) * AMBIENT_LOOK_EVERY_MS;
+  if (next < stop) at(next);
+  return null;
+}
+
+/**
+ * Window motion (round 3, 2a). Never with `roam` off, quiet, on battery,
+ * with reduced motion, locked or asleep. Else:
+ *   'dash' — at a session start (calendar `live`, sessionReactions ≠ off):
+ *     from the end of the start jump until DASH_WINDOW_MS after the start,
+ *     while the pet is calendar / ambient and nobody touched it since the
+ *     start (an interaction ends the dash for good: it never runs twice);
+ *   'roam' — ambient layer, no bubble, no pet input for ROAM_AFTER_INPUT_MS.
+ * @param {BehaviourInput} input
+ * @param {{
+ *   now: number, quiet: boolean,
+ *   calendar: ReturnType<typeof activeCalendar>,
+ *   bubble: object|null,
+ *   pick: { layer: Layer, sleeping?: boolean },
+ *   at: (ms: number) => void
+ * }} ctx
+ * @returns {null|'roam'|'dash'}
+ */
+function pickMotion(input, { now, quiet, calendar, bubble, pick, at }) {
+  if (input.roam !== true || quiet) return null;
+  if (!extrasAllowed(input)) return null;
+  // Sleep (2b) marks the ambient pick `sleeping`: a sleeping pet stays put.
+  if (pick.sleeping) return null;
+  const lastInput = Number.isFinite(input.lastInteractionAtMs)
+    ? /** @type {number} */ (input.lastInteractionAtMs)
+    : null;
+  if (
+    calendar?.phase === 'live' &&
+    (pick.layer === 'calendar' || pick.layer === 'ambient') &&
+    (lastInput === null || lastInput <= calendar.phaseStartMs)
+  ) {
+    const from = calendar.phaseStartMs + stateDurationMs('jumping');
+    const until = calendar.phaseStartMs + DASH_WINDOW_MS;
+    if (now < from) at(from);
+    else if (now < until) {
+      at(until);
+      return 'dash';
+    }
+  }
+  if (pick.layer !== 'ambient' || bubble) return null;
+  if (lastInput !== null && now < lastInput + ROAM_AFTER_INPUT_MS) {
+    at(lastInput + ROAM_AFTER_INPUT_MS);
+    return null;
+  }
+  return 'roam';
+}
+
 // --- Once-only companion moments (plan §12 #1, #4) and hover texts (#8) ---
 
 /**
  * May a once-only moment of `kind` start now? Never over a user action, a
  * celebration or chat; a result may push aside a calendar bubble (it ranks
- * higher), a rate nudge / daily fact waits for an idle pet with no bubble.
- * @param {'result'|'rate'|'fact'} kind
+ * higher), a greeting / rate nudge / daily fact waits for an idle pet with
+ * no bubble (a sleeping pet is idle: the bubble wakes it).
+ * @param {'result'|'greeting'|'rate'|'fact'} kind
  * @param {Behaviour} out the behaviour computed without the new moment
  */
 export function canStartMoment(kind, out) {
@@ -646,4 +810,210 @@ export function duoHeadToHead({
     text: `${season}${label(left)} ${winsLeft}–${winsRight} ${label(right)} (races)`,
     target: `/stats/compare/drivers?ids=${left},${right}${range}`
   };
+}
+
+// --- Duo reactions (4b): the second sprite's own pose ---
+
+/** Ambient duo wave: the first one this long after the last input… */
+export const DUO_WAVE_FIRST_MS = 5 * 60 * 1000;
+/** …then one every DUO_WAVE_EVERY_MS… */
+export const DUO_WAVE_EVERY_MS = 10 * 60 * 1000;
+/**
+ * …while the pet is awake (it sleeps at AMBIENT_SLEEP_MS, 2b): waves at 5,
+ * 15 and 25 min, never on the 10-min `waiting` switch nor on a look-around
+ * (those start on even minutes).
+ */
+export const DUO_WAVE_UNTIL_MS = AMBIENT_SLEEP_MS;
+/** The second pet waves back this long after the first (one `waving` play). */
+export const DUO_WAVE_DELAY_MS = 700;
+
+/**
+ * @typedef {{ key: string, first: string, second: string }} DuoResultPoses
+ *   Head-to-head poses of the latest race (`key` = its race key) for the
+ *   first and the second sprite (`duoResultPoses`).
+ * @typedef {{ result: DuoResultPoses|null }} DuoInput
+ *   Set by the controller only while a duo shows and both pets map to
+ *   (different) drivers via `petDrivers`, like the head-to-head hover.
+ * @typedef {{ state: string, once: boolean, playKey: string, delayMs: number }} SecondPose
+ *   The duo's second sprite plays this instead of the first's animation;
+ *   `delayMs` holds the row's first frame that long before it plays.
+ */
+
+/** Layers that move both sprites alike: the second mirrors the first. */
+const SHARED_LAYERS = new Set(['interaction', 'quiet', 'celebrate', 'chat']);
+
+/** "petdex:max-4" → its driver id via `petDrivers`, or null. */
+const petDriver = (feed, petId) => {
+  const slug = petdexSlugOf(petId);
+  const driver = slug ? feed?.petDrivers?.[slug] : null;
+  return typeof driver === 'string' && driver ? driver : null;
+};
+
+/**
+ * The duo's drivers (first sprite, second sprite), or null unless both pets
+ * map to different drivers — the condition for every duo reaction.
+ * @param {{ feed: any, firstPetId: string|null, secondPetId: string|null }} input
+ * @returns {{ first: string, second: string } | null}
+ */
+export function duoDrivers({ feed, firstPetId, secondPetId }) {
+  const first = petDriver(feed, firstPetId);
+  const second = petDriver(feed, secondPetId);
+  return first && second && first !== second ? { first, second } : null;
+}
+
+/** A classified finish (position > 0), else null (nc / dnf / dsq / dns / dnq). */
+const finishPosition = (entry) =>
+  Number.isSafeInteger(entry.position) && entry.position > 0
+    ? entry.position
+    : null;
+
+/**
+ * Head-to-head poses of the feed's latest race: the better finisher
+ * `jumping`, the other `failed`; any unclassified result counts as worse
+ * than a finish; both unclassified → both `failed`; equal → both `waving`.
+ * Null when the race or either driver's result is missing.
+ * @param {{ feed: any, firstDriverId: string, secondDriverId: string }} input
+ * @returns {DuoResultPoses|null}
+ */
+export function duoResultPoses({ feed, firstDriverId, secondDriverId }) {
+  const race = feed?.latestRace;
+  if (!race?.key || !Array.isArray(race.results)) return null;
+  const a = race.results.find((r) => r.driverId === firstDriverId);
+  const b = race.results.find((r) => r.driverId === secondDriverId);
+  if (!a || !b) return null;
+  const pa = finishPosition(a);
+  const pb = finishPosition(b);
+  const poses = (first, second) => ({ key: race.key, first, second });
+  if (pa === null && pb === null) return poses('failed', 'failed');
+  if (pa === pb) return poses('waving', 'waving');
+  return pb === null || (pa !== null && pa < pb)
+    ? poses('jumping', 'failed')
+    : poses('failed', 'jumping');
+}
+
+/**
+ * The input's duo poses when they belong to the result moment showing.
+ * @param {BehaviourInput} input
+ */
+function duoMomentPoses(input) {
+  const moment = input.moment;
+  const poses = input.duo?.result;
+  if (moment?.kind !== 'result' || !poses || poses.key !== moment.key) {
+    return null;
+  }
+  if (!Number.isFinite(moment.atMs)) return null;
+  return STATE_BY_ID.has(poses.first) && STATE_BY_ID.has(poses.second)
+    ? poses
+    : null;
+}
+
+/**
+ * The moment, with the duo's head-to-head pose (played once) for the first
+ * sprite in place of the favourite's own pose.
+ * @param {BehaviourInput} input
+ */
+function momentWithDuoPose(input) {
+  const poses = duoMomentPoses(input);
+  return poses
+    ? { ...input.moment, state: poses.first, once: true }
+    : input.moment;
+}
+
+/**
+ * Wave start times from the last input: the latest one at or before `now`
+ * (null before the first / after DUO_WAVE_UNTIL_MS) and the next one.
+ * @param {number} lastActivityAtMs @param {number} now
+ * @returns {{ current: number|null, next: number|null }}
+ */
+export function duoWaveTimes(lastActivityAtMs, now) {
+  const first = lastActivityAtMs + DUO_WAVE_FIRST_MS;
+  const end = lastActivityAtMs + DUO_WAVE_UNTIL_MS;
+  const within = (ms) => (ms < end ? ms : null);
+  if (now < first) return { current: null, next: within(first) };
+  const current =
+    first + Math.floor((now - first) / DUO_WAVE_EVERY_MS) * DUO_WAVE_EVERY_MS;
+  return {
+    current: within(current),
+    next: within(current + DUO_WAVE_EVERY_MS)
+  };
+}
+
+/**
+ * Ambient waves need a mapped duo and a pet that may move (`extrasAllowed`).
+ * @param {BehaviourInput} input
+ */
+const duoWaves = (input) => Boolean(input.duo) && extrasAllowed(input);
+
+/**
+ * Ambient layer: the first sprite's wave while one is due, else null (the
+ * next wave start becomes a boundary either way).
+ * @param {BehaviourInput} input @param {number} now @param {number} lastActivity
+ * @param {(ms: number) => void} at
+ */
+function duoWaveFirst(input, now, lastActivity, at) {
+  if (!duoWaves(input)) return null;
+  const { current, next } = duoWaveTimes(lastActivity, now);
+  if (next !== null) at(next);
+  if (current === null) return null;
+  const until = current + stateDurationMs('waving');
+  if (now >= until) return null;
+  at(until);
+  return {
+    state: 'waving',
+    once: true,
+    still: false,
+    playKey: `duo-wave:${current}`,
+    layer: /** @type {Layer} */ ('ambient')
+  };
+}
+
+/**
+ * The duo's second sprite (4b), or null = it plays the first's animation.
+ * Interaction, quiet, celebration and chat move both alike; under them the
+ * second's own pose waits. A result moment's head-to-head pose runs its own
+ * length (it may outlast the first's); an ambient wave answers the first's
+ * DUO_WAVE_DELAY_MS later. A sleeping first sprite stills both.
+ * @param {BehaviourInput} input
+ * @param {{ now: number, at: (ms: number) => void }} ctx
+ * @param {{ layer: Layer, sleeping?: boolean }} pick the first sprite's pick
+ * @returns {SecondPose|null}
+ */
+function pickSecond(input, { now, at }, pick) {
+  if (!input.duo || pick.sleeping || SHARED_LAYERS.has(pick.layer)) {
+    return null;
+  }
+  const poses = duoMomentPoses(input);
+  if (poses && now >= input.moment.atMs) {
+    const until = input.moment.atMs + stateDurationMs(poses.second);
+    if (now < until) {
+      at(until);
+      const { kind, key, atMs } = input.moment;
+      return {
+        state: poses.second,
+        once: true,
+        playKey: `${kind}:${key}:${atMs}:second`,
+        delayMs: 0
+      };
+    }
+  }
+  if (pick.layer === 'ambient' && duoWaves(input)) {
+    const lastActivity = Number.isFinite(input.lastActivityAtMs)
+      ? input.lastActivityAtMs
+      : now;
+    const { current } = duoWaveTimes(lastActivity, now);
+    const until =
+      current === null
+        ? -Infinity
+        : current + DUO_WAVE_DELAY_MS + stateDurationMs('waving');
+    if (now < until) {
+      at(until);
+      return {
+        state: 'waving',
+        once: true,
+        playKey: `duo-wave:${current}:second`,
+        delayMs: DUO_WAVE_DELAY_MS
+      };
+    }
+  }
+  return null;
 }

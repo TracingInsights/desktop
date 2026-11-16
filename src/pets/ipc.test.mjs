@@ -2,14 +2,20 @@ import { describe, test, expect } from 'bun:test';
 import {
   createPetsIpc,
   isPetWindowSender,
+  validateActionId,
   validateCelebrateInput,
   validateSearchInput,
   validateShelfInput
 } from './ipc.mjs';
 import { isTrustedAppSender } from '../ipc.mjs';
-import { PET_WINDOW_CHANNELS, PETS_CHANNELS } from './contract.mjs';
+import {
+  BUBBLE_ACTION_IDS,
+  PANEL_ACTION_IDS,
+  PET_WINDOW_CHANNELS,
+  PETS_CHANNELS
+} from './contract.mjs';
 
-const APP_ORIGIN = 'https://app.tracinginsights.com';
+const APP_ORIGIN = 'https://tracinginsights.com';
 
 function fakeIpcMain() {
   const handlers = new Map();
@@ -100,7 +106,7 @@ describe('pets:* sender checks', () => {
     for (const event of [
       fromPet(),
       fromPet(`${APP_ORIGIN}/`),
-      fromMain('https://app.tracinginsights.com.evil.com/'),
+      fromMain('https://tracinginsights.com.evil.com/'),
       { sender: { id: 'other' }, senderFrame: { url: `${APP_ORIGIN}/` } },
       { sender: state.mainWindow.webContents, senderFrame: null }
     ]) {
@@ -384,5 +390,132 @@ describe('companion channels (round 2)', () => {
       expect((await ipcMain.invoke(channel, fromPet(), arg)).ok).toBe(false);
     }
     expect(calls).toEqual([]);
+  });
+});
+
+describe('round 3: bubble / panel buttons and the signal sender', () => {
+  test('every bubble and panel button id reaches the controller', () => {
+    const { ipcMain, fromPet, petEvents } = setup();
+    for (const id of BUBBLE_ACTION_IDS) {
+      ipcMain.emit(PET_WINDOW_CHANNELS.bubbleAction, fromPet(), { id });
+    }
+    for (const id of [...PANEL_ACTION_IDS, 'close']) {
+      ipcMain.emit(PET_WINDOW_CHANNELS.panelAction, fromPet(), { id });
+    }
+    expect(petEvents).toEqual([
+      ['bubbleAction', 'ok'],
+      ['bubbleAction', 'quiet-1h'],
+      ['bubbleAction', 'quiet-session'],
+      ['bubbleAction', 'mute'],
+      ['panelAction', 'ask'],
+      ['panelAction', 'rate'],
+      ['panelAction', 'stats'],
+      ['panelAction', 'hot-lap'],
+      ['panelAction', 'pets'],
+      ['panelAction', 'close']
+    ]);
+  });
+
+  test('unknown ids and anything but exactly { id } are dropped', () => {
+    const { ipcMain, fromPet, petEvents } = setup();
+    const bad = [
+      undefined,
+      null,
+      'ok',
+      ['ok'],
+      {},
+      { id: 1 },
+      { id: 'OK' },
+      { id: 'ok ' },
+      { id: 'quiet-forever' },
+      { id: 'ok', extra: true },
+      { id: '__proto__' },
+      Object.assign(Object.create(null), { id: 'ok' }),
+      // The other channel's ids.
+      { id: 'close' },
+      { id: 'ask' }
+    ];
+    for (const input of bad) {
+      ipcMain.emit(PET_WINDOW_CHANNELS.bubbleAction, fromPet(), input);
+    }
+    for (const input of [
+      ...bad.slice(0, 12),
+      { id: 'ok' },
+      { id: 'mute' },
+      { id: 'settings' }
+    ]) {
+      ipcMain.emit(PET_WINDOW_CHANNELS.panelAction, fromPet(), input);
+    }
+    expect(petEvents).toEqual([]);
+  });
+
+  test('button events from the main window or another page are ignored', () => {
+    const { ipcMain, fromMain, fromPet, petEvents } = setup();
+    ipcMain.emit(PET_WINDOW_CHANNELS.bubbleAction, fromMain(), { id: 'ok' });
+    ipcMain.emit(PET_WINDOW_CHANNELS.panelAction, fromMain(), { id: 'ask' });
+    ipcMain.emit(
+      PET_WINDOW_CHANNELS.panelAction,
+      fromPet('https://evil.example/'),
+      { id: 'pets' }
+    );
+    expect(petEvents).toEqual([]);
+  });
+
+  test('validateActionId', () => {
+    expect(validateActionId({ id: 'ok' }, BUBBLE_ACTION_IDS)).toBe('ok');
+    expect(validateActionId({ id: 'ok' }, PANEL_ACTION_IDS)).toBeNull();
+    expect(validateActionId({ id: 'pets' }, PANEL_ACTION_IDS)).toBe('pets');
+    expect(validateActionId({ id: 'pets', x: 1 }, PANEL_ACTION_IDS)).toBeNull();
+    expect(validateActionId('pets', PANEL_ACTION_IDS)).toBeNull();
+  });
+
+  test('pets:signal tells the service which window sent it', async () => {
+    const ipcMain = fakeIpcMain();
+    const calls = [];
+    const main = makeWindow('main-1');
+    const ask = makeWindow('ask-1');
+    createPetsIpc({
+      ipcMain,
+      isTrustedSender: (event) =>
+        isTrustedAppSender(event, {
+          mainWindow: main,
+          windows: [ask],
+          appOrigin: APP_ORIGIN
+        }),
+      isPetSender: () => false,
+      service: {
+        signal: (...args) => {
+          calls.push(args);
+          return { ok: true };
+        }
+      },
+      onPetEvent: () => {},
+      signalSource: (event) =>
+        event.sender === ask.webContents ? 'ask' : 'main',
+      log: () => {}
+    }).register();
+    const from = (win, url = `${APP_ORIGIN}/desktop/ask`) => ({
+      sender: win.webContents,
+      senderFrame: { url }
+    });
+    expect(
+      (await ipcMain.invoke(PETS_CHANNELS.signal, from(ask), 'done')).ok
+    ).toBe(true);
+    await ipcMain.invoke(
+      PETS_CHANNELS.signal,
+      from(main, `${APP_ORIGIN}/chat`),
+      'done'
+    );
+    // Untrusted pages never reach the service.
+    await ipcMain.invoke(
+      PETS_CHANNELS.signal,
+      from(ask, 'https://evil.example/'),
+      'done'
+    );
+    await ipcMain.invoke(PETS_CHANNELS.signal, from(ask), 'dance');
+    expect(calls).toEqual([
+      ['done', 'ask'],
+      ['done', 'main']
+    ]);
   });
 });

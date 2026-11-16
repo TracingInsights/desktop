@@ -14,6 +14,7 @@ import {
   MOMENT_GAP_MS
 } from './controller.mjs';
 import {
+  AMBIENT_SLEEP_MS,
   AMBIENT_WAITING_MS,
   HOVER_BUBBLE_MS,
   stateDurationMs
@@ -208,6 +209,7 @@ function setup({
         resultReactions: true,
         rateNudge: false,
         dailyFact: false,
+        greetings: false,
         ...overrides
       },
       { trusted: true }
@@ -299,6 +301,10 @@ describe('hover (#2 countdown, #8 head-to-head)', () => {
     clock.advance(1000);
     controller.petEvent('click');
     expect(last()).toMatchObject({ state: 'jumping' });
+    // The click opened the panel in place of the bubble (round 3); once it
+    // closes, the hover bubble is back for the rest of its own time.
+    expect(last().bubble).toBeNull();
+    controller.petEvent('panelAction', 'close');
     expect(last().bubble).toContain('Qualifying in');
     clock.advance(HOVER_BUBBLE_MS);
     expect(last().bubble).toBeNull();
@@ -518,14 +524,19 @@ describe('rate nudge (#4)', () => {
     });
     controller.start();
     expect(last().bubble).toBeNull();
-    // One timer: the ambient threshold first, then exactly end + 1 h.
+    // One timer: the ambient thresholds first (waiting, sleep), then
+    // exactly end + 1 h.
     clock.advance(AMBIENT_WAITING_MS);
     expect(last().state).toBe('waiting');
+    clock.advance(AMBIENT_SLEEP_MS - AMBIENT_WAITING_MS);
+    expect(last()).toMatchObject({ state: 'idle', sleeping: true });
     expect(clock.pending()).toEqual([SP_END + HOUR]);
-    clock.advance(HOUR - AMBIENT_WAITING_MS - 1);
+    clock.advance(HOUR - AMBIENT_SLEEP_MS - 1);
     expect(last().bubble).toBeNull();
     clock.advance(1);
     expect(last().bubble).toBe('Rate the São Paulo GP');
+    // The bubble wakes the sleeping pet while it shows.
+    expect(last()).toMatchObject({ state: 'waiting', sleeping: false });
     expect(settings.get().lastRateKey).toBe(SP_RACE.key);
     controller.petEvent('bubbleClick');
     expect(opened).toEqual(['/rate/2026/sao-paulo/race']);

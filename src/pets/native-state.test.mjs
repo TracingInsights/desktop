@@ -40,6 +40,23 @@ describe('parseNativeState', () => {
     expect(parseNativeState({ v: 2, enabled: true }).patch).toEqual({});
     expect(parseNativeState(null).patch).toEqual({});
   });
+
+  test('offline mutes become the settings the "No …" buttons write; greeting moments count', () => {
+    const parsed = parseNativeState({
+      v: 1,
+      mutes: ['fact', 'calendar', 'greeting', 'hover', 7, 'fact'],
+      shownMoments: [{ name: 'lastGreetingKey', value: '2026-11-07:evening' }]
+    });
+    expect(parsed.patch).toEqual({
+      dailyFact: false,
+      sessionReactions: 'off',
+      greetings: false
+    });
+    expect(parsed.markers).toEqual([
+      { name: 'lastGreetingKey', value: '2026-11-07:evening' }
+    ]);
+    expect(parseNativeState({ v: 1, mutes: 'fact' }).patch).toEqual({});
+  });
 });
 
 describe('mergeNativeState', () => {
@@ -72,6 +89,29 @@ describe('mergeNativeState', () => {
     expect(after.positions.last).toEqual({ x: 100, y: 200 });
     expect(after.lastRateKey).toBe('2026-21-race');
     expect(after.lastFactDay).toBe('2026-11-07');
+    expect(existsSync(join(dir, NATIVE_STATE_FILE))).toBe(false);
+  });
+
+  test('offline mutes and a greeting reach the settings', () => {
+    const dir = tempDir();
+    const settings = createPetsSettings({ userDataDir: dir });
+    writeFileSync(
+      join(dir, NATIVE_STATE_FILE),
+      JSON.stringify({
+        v: 1,
+        updatedAt: '2026-11-07T18:00:00.000Z',
+        mutes: ['rate', 'result'],
+        shownMoments: [{ name: 'lastGreetingKey', value: '2026-11-07:evening' }]
+      })
+    );
+    expect(mergeNativeState({ userDataDir: dir, settings })).toEqual({
+      applied: ['rateNudge', 'resultReactions'],
+      markers: 1
+    });
+    const after = settings.get();
+    expect(after.rateNudge).toBe(false);
+    expect(after.resultReactions).toBe(false);
+    expect(after.lastGreetingKey).toBe('2026-11-07:evening');
     expect(existsSync(join(dir, NATIVE_STATE_FILE))).toBe(false);
   });
 

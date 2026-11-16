@@ -16,8 +16,8 @@
  * recompile (tomorrow's fact hour, each race end + RACE_REFRESH_AFTER_MS for
  * the result and rate nudge, and a day before the horizon runs out).
  *
- * Timeline file (v1, `userData/pet-timeline.json`, mirrored by
- * packages/ti-pet/src/timeline.zig):
+ * Timeline file (`userData/pet-timeline.json`, mirrored by
+ * packages/ti-pet/src/timeline.zig). v1, what every native pet plays:
  *   {
  *     v: 1, generatedAt, until, refreshAt,              // ISO UTC
  *     pets: { first: Sprite|null, second: Sprite|null }, // Sprite = { id, path, rows, scale }
@@ -37,6 +37,20 @@
  *                                                         // "<label> is live · <gp>" (schedule.mjs)
  *   }
  *
+ * v2 (round 3) goes only to a pet whose `ready.caps` has `timeline-v2`
+ * (`caps` input; an older pet rejects the file): `v: 2`, and each visible
+ * entry may add, each behind its own render cap (toNativeRender):
+ *   motion: 'roam'|'dash'|null, sleeping: boolean,
+ *   bubbleActions: { id, label }[]|null, bubbleKind: string|null (BUBBLE_KINDS,
+ *   what an offline `mute` silences), secondAnim: { state, row, frames,
+ *   durationMs, once, still, playKey, delayMs }|null,
+ *   moment.name may be 'lastGreetingKey';
+ * plus a top-level static click panel (offline, `staticPanel`):
+ *   panel: { lines: string[], countdown: true, actions: { id, label,
+ *     target, from?: ISO, until?: ISO }[] } | null
+ * A v1 file keeps only the v1 moment names (TIMELINE_V1_MOMENTS). Without
+ * the `v2-rows` cap a look-around entry is written as idle (either version).
+ *
  * The native pet reports back, in pet-native-state.json, the `moment`
  * markers whose entries it actually showed (native-state.mjs), so a moment
  * is never lost (pet hidden, quiet) or repeated.
@@ -44,10 +58,13 @@
 import {
   SESSION_DURATION_MS,
   DAILY_FACT_HOUR,
-  PET_SIZES
+  PET_SIZES,
+  RATE_NUDGE_AFTER_END_MS,
+  RATE_NUDGE_WINDOW_MS
 } from './contract.mjs';
 import { createPetController } from './controller.mjs';
 import { duoHeadToHead, CALENDAR_TARGET } from './behaviour.mjs';
+import { panelActions, panelLines } from './panel.mjs';
 import {
   calendarPhase,
   SESSION_LABELS,
@@ -56,7 +73,13 @@ import {
   upcomingSessions
 } from './schedule.mjs';
 import { localDayKey, nextLocalHourAt } from './facts.mjs';
-import { TIMELINE_VERSION } from './native-protocol.mjs';
+import {
+  capSet,
+  NATIVE_CAPS,
+  TIMELINE_VERSION,
+  TIMELINE_VERSION_V1,
+  toNativeRender
+} from './native-protocol.mjs';
 
 export const TIMELINE_HORIZON_MS = 7 * 24 * 60 * 60 * 1000;
 /** Recompile this long after a race's nominal end (result + rate nudge). */
@@ -67,6 +90,19 @@ export const MIN_REFRESH_MS = 5 * 60 * 1000;
 export const MAX_STEPS = 50_000;
 
 const iso = (ms) => new Date(ms).toISOString();
+
+/**
+ * Moment markers a v1 timeline may carry. The pinned native pet
+ * (ti-pet-v0.1.1, timeline.zig `MomentName`) rejects the whole file on any
+ * other name, so in a v1 file a round-3 greeting entry keeps its bubble and
+ * target but no `moment` (its `lastGreetingKey` stays Electron-side). A v2
+ * pet knows the name.
+ */
+const TIMELINE_V1_MOMENTS = new Set([
+  'lastResultKey',
+  'lastRateKey',
+  'lastFactDay'
+]);
 
 /**
  * A virtual clock: `setTimeout` stores the callback at now + delay; `run`
@@ -140,6 +176,57 @@ function settingsCopy(snapshot) {
   };
 }
 
+/** Rate buttons a static panel carries at most (one per race window). */
+const MAX_PANEL_RATES = 2;
+
+/**
+ * The click panel the native pet shows while Electron is gone (timeline v2
+ * `panel`): panel.mjs's lines and actions as of `nowMs`, minus the
+ * countdown line (the pet computes it like the hover text: `countdown:
+ * true`), each action with the app path it opens. The rate action exists
+ * only inside a race's rate window, so each race whose window overlaps the
+ * timeline gets one with `from` / `until` (ISO), cut at the next race's.
+ * @param {{ feed: any, favoriteDriverId?: string|null, nowMs: number, untilMs: number }} input
+ * @returns {{ lines: string[], countdown: true, actions: { id: string, label: string, target: string, from?: string, until?: string }[] }}
+ */
+export function staticPanel({ feed, favoriteDriverId = null, nowMs, untilMs }) {
+  const lines = panelLines({ sessions: [], feed, favoriteDriverId, nowMs });
+  /** @type {{ id: string, label: string, target: string, from: number, until: number }[]} */
+  const rates = [];
+  for (const s of feed?.sessions ?? []) {
+    if (s.kind !== 'race' || !s.rateSlug) continue;
+    const end = Date.parse(s.startsAt) + SESSION_DURATION_MS.race;
+    if (!Number.isFinite(end)) continue;
+    const from = end + RATE_NUDGE_AFTER_END_MS;
+    const until = end + RATE_NUDGE_WINDOW_MS;
+    if (until <= nowMs || from >= untilMs) continue;
+    const at = Math.max(nowMs, from);
+    const rate = panelActions({ feed, nowMs: at }).find((a) => a.id === 'rate');
+    if (rate) rates.push({ ...rate, from, until });
+  }
+  rates.sort((a, b) => a.from - b.from);
+  // A later race's button replaces the earlier one (panel.mjs shows one).
+  for (let i = 0; i + 1 < rates.length; i += 1) {
+    rates[i].until = Math.min(rates[i].until, rates[i + 1].from);
+  }
+  const actions = [];
+  for (const action of panelActions({ feed: null, nowMs })) {
+    if (action.id === 'stats') {
+      for (const rate of rates.slice(-MAX_PANEL_RATES)) {
+        actions.push({
+          id: rate.id,
+          label: rate.label,
+          target: rate.target,
+          from: iso(rate.from),
+          until: iso(rate.until)
+        });
+      }
+    }
+    actions.push({ id: action.id, label: action.label, target: action.target });
+  }
+  return { lines, countdown: true, actions };
+}
+
 /**
  * When the native pet should start Electron to recompile.
  * @param {{ nowMs: number, untilMs: number, sessions: readonly { kind: string, startsAt: string }[] }} input
@@ -169,8 +256,10 @@ export function refreshAtFor({ nowMs, untilMs, sessions }) {
  *   nowMs: number,
  *   horizonMs?: number,
  *   environment?: { reducedMotion?: boolean, onBattery?: boolean },
- *   secondSide?: 'left'|'right'
- * }} input
+ *   secondSide?: 'left'|'right',
+ *   caps?: readonly string[]|null
+ * }} input  `caps` = the native pet's `ready.caps` (none = ti-pet-v0.1.1:
+ *   a v1 file without look-around states)
  */
 export function compileTimeline(input) {
   const {
@@ -182,8 +271,10 @@ export function compileTimeline(input) {
     nowMs,
     horizonMs = TIMELINE_HORIZON_MS,
     environment = {},
-    secondSide = 'left'
+    secondSide = 'left',
+    caps = null
   } = input;
+  const v2 = capSet(caps).has(NATIVE_CAPS.timelineV2);
   const untilMs = nowMs + horizonMs;
   const clock = createVirtualClock(nowMs);
   const copy = settingsCopy(settings);
@@ -219,21 +310,39 @@ export function compileTimeline(input) {
         pets.second = sprite(payload.second, current.secondPetId);
       }
       const bubble = controller?.currentBubble() ?? null;
-      entries.push({
+      const marker = payload.bubble ? (bubble?.marker ?? null) : null;
+      // What this pet can take (look states → idle without `v2-rows`, the
+      // round-3 fields behind their caps): the live render's own rules.
+      const native = toNativeRender(payload, () => '-', caps);
+      if (!native) return;
+      const entry = {
         at: clock.now(),
         visible: true,
-        state: payload.state,
-        row: payload.row,
-        frames: payload.frames,
-        durationMs: payload.durationMs,
-        once: Boolean(payload.once),
-        still: Boolean(payload.still),
-        playKey: String(payload.playKey ?? ''),
+        state: native.state,
+        row: native.row,
+        frames: native.frames,
+        durationMs: native.durationMs,
+        once: native.once,
+        still: native.still,
+        playKey: native.playKey,
         bubble: payload.bubble ?? null,
         bubbleTarget: payload.bubble ? (bubble?.target ?? null) : null,
         duo: Boolean(payload.second),
-        moment: payload.bubble ? (bubble?.marker ?? null) : null
-      });
+        moment:
+          marker && (v2 || TIMELINE_V1_MOMENTS.has(marker.name)) ? marker : null
+      };
+      if (v2) {
+        for (const key of [
+          'motion',
+          'sleeping',
+          'bubbleActions',
+          'secondAnim'
+        ]) {
+          if (Object.hasOwn(native, key)) entry[key] = native[key];
+        }
+        entry.bubbleKind = payload.bubble ? (bubble?.kind ?? null) : null;
+      }
+      entries.push(entry);
     },
     moveBy() {},
     savePosition() {},
@@ -299,7 +408,7 @@ export function compileTimeline(input) {
       : null;
 
   return {
-    v: TIMELINE_VERSION,
+    v: v2 ? TIMELINE_VERSION : TIMELINE_VERSION_V1,
     generatedAt: iso(nowMs),
     until: iso(untilMs),
     refreshAt: iso(
@@ -317,6 +426,16 @@ export function compileTimeline(input) {
     sessions,
     duo: duo ? { text: duo.text, target: duo.target } : null,
     calendarTarget: CALENDAR_TARGET,
-    countdown: { format: 'v1' }
+    countdown: { format: 'v1' },
+    ...(v2
+      ? {
+          panel: staticPanel({
+            feed,
+            favoriteDriverId: current.favoriteDriverId ?? null,
+            nowMs,
+            untilMs
+          })
+        }
+      : {})
   };
 }

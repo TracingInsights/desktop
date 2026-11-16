@@ -149,7 +149,11 @@ describe('isThumbDataUrl', () => {
 });
 
 describe('createThumbRenderer', () => {
-  function setup({ result = 'data:image/png;base64,QUJD', fail = false } = {}) {
+  function setup({
+    result = 'data:image/png;base64,QUJD',
+    fail = false,
+    beforeResult = async () => {}
+  } = {}) {
     const windows = [];
     const timers = new Map();
     let seq = 0;
@@ -168,6 +172,7 @@ describe('createThumbRenderer', () => {
           webContents: {
             executeJavaScript: async (code) => {
               win.codes.push(code);
+              await beforeResult();
               if (fail) throw new Error('decode failed');
               return result;
             }
@@ -193,7 +198,7 @@ describe('createThumbRenderer', () => {
         }
       }
     };
-    return { renderer, windows, fireIdle };
+    return { renderer, windows, fireIdle, timers };
   }
   const record = { imagePath: '/p/sprite.webp', atlas: { scale: 1 } };
 
@@ -228,5 +233,36 @@ describe('createThumbRenderer', () => {
     const { renderer, windows } = setup({ fail: true });
     expect(await renderer.thumbFor(record)).toBe('');
     expect(windows[0].destroyed).toBe(true);
+  });
+
+  test('a thrown render is retried next time (not cached as "")', async () => {
+    let fail = true;
+    const { renderer, windows } = setup({
+      beforeResult: async () => {
+        if (fail) throw new Error('thumb timeout');
+      }
+    });
+    expect(await renderer.thumbFor(record)).toBe('');
+    fail = false;
+    expect(await renderer.thumbFor(record)).toBe('data:image/png;base64,QUJD');
+    expect(windows.length).toBe(2);
+  });
+
+  test("the last job's idle timer cannot dispose the window mid-render", async () => {
+    let hold = false;
+    let release = () => {};
+    const { renderer, windows, fireIdle } = setup({
+      beforeResult: () =>
+        hold ? new Promise((resolve) => (release = resolve)) : undefined
+    });
+    await renderer.thumbFor(record);
+    hold = true;
+    const second = renderer.thumbFor({ ...record, atlas: { scale: 2 } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Any idle timer still armed fires while the second job renders.
+    fireIdle();
+    expect(windows[0].destroyed).toBe(false);
+    release();
+    expect(await second).toBe('data:image/png;base64,QUJD');
   });
 });

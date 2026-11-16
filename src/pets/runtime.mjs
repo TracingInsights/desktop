@@ -19,7 +19,7 @@ import * as net from 'node:net';
 import { join } from 'node:path';
 import { PET_WINDOW_CHANNELS } from './contract.mjs';
 import { createPetsSettings } from './settings.mjs';
-import { createPetStore } from './pet-store.mjs';
+import { createPetStore, petFolderHomes } from './pet-store.mjs';
 import { createPetdexClient } from './petdex-client.mjs';
 import { createImporter } from './importer.mjs';
 import { createFacts } from './facts.mjs';
@@ -83,7 +83,7 @@ const settle = (promise, ms) =>
  *     systemPreferences: any
  *   },
  *   appUrl: string,
- *   appOrigin: string,
+ *   appOrigin: string | readonly string[],
  *   getMainWindow: () => any,
  *   createMainWindow: (path?: string) => any,
  *   userDataDir: string,
@@ -104,6 +104,7 @@ const settle = (promise, ms) =>
  *   appLaunch?: { execPath: string, args: readonly string[] },
  *   tmpDir?: string,
  *   beforeHandoffQuit?: () => void,
+ *   installArmed?: () => boolean,
  *   spawnNative?: typeof spawn
  * }} options
  */
@@ -133,7 +134,7 @@ export function createPetsRuntime(options) {
   const settings = createPetsSettings({ userDataDir });
   const store = createPetStore({
     userDataDir,
-    codexHome: env.CODEX_HOME || join(options.homeDir, '.codex'),
+    ...petFolderHomes({ env, homeDir: options.homeDir }),
     decodeImage: createDecodeImage(nativeImage),
     makeThumb: createMakeThumb(nativeImage),
     getSettings: settings.get
@@ -274,10 +275,9 @@ export function createPetsRuntime(options) {
           positions[LAST_POSITION_KEY] = { x, y };
           settings.update({ positions }, { trusted: true });
         },
-        onEvent: (event, dx, dy) =>
-          event === 'drag'
-            ? controller.petEvent('drag', dx, dy)
-            : controller.petEvent(/** @type {any} */ (event)),
+        // drag → (dx, dy); bubbleAction / panelAction → (id) (round 3).
+        onEvent: (event, ...args) =>
+          controller.petEvent(/** @type {any} */ (event), ...args),
         onMenuAction: (id, checked) => {
           const handler = nativeMenuHandlers.get(id);
           handler?.(checked === undefined ? {} : { checked });
@@ -318,6 +318,11 @@ export function createPetsRuntime(options) {
       }
       if (kind === 'electron' && trayWanted) tray?.ensure();
       if (kind === 'native') pushNativeMenus();
+      // The last window closed while the renderer was still pending.
+      if (kind !== 'pending' && handOffWhenNative) {
+        handOffWhenNative = false;
+        if (kind === 'native') onAppWindowClosed();
+      }
       // The login item follows the renderer (native pet vs app --hidden).
       if (kind !== 'pending' && settings.get().launchAtLogin) {
         try {
@@ -346,6 +351,11 @@ export function createPetsRuntime(options) {
     petWindow,
     support,
     openMain: (path) => lifecycle.openMain(path),
+    // Click panel "Ask F1" / a click on the "Answer ready" badge (round 3).
+    openAsk: () => {
+      askWindow.open();
+    },
+    askInBackground: () => askWindow.inBackground(),
     showContextMenu: () => {
       const window = petWindow.window();
       Menu.buildFromTemplate(
@@ -489,6 +499,7 @@ export function createPetsRuntime(options) {
     openExternal: options.openExternal,
     downloadDir: join(userDataDir, 'pet-downloads'),
     iconPath: options.windowIconPath,
+    onClosed: () => onAppWindowClosed(),
     onPetDownload: (path) => {
       void service
         .importFile(path)
@@ -527,8 +538,16 @@ export function createPetsRuntime(options) {
     platform,
     iconPath: options.windowIconPath,
     onCreated: (window) => {
-      window.on('focus', () => controller.noteActivity());
       options.onAskWindowCreated?.(window);
+    },
+    // Opened or focused: activity, and its answer has been seen (badge).
+    onAttention: () => {
+      controller.noteActivity();
+      controller.clearBadge();
+    },
+    onClosed: () => {
+      controller.clearBadge();
+      onAppWindowClosed();
     }
   });
 
@@ -544,7 +563,12 @@ export function createPetsRuntime(options) {
     isPetSender: (event) =>
       isPetWindowSender(event, { petWindow: petWindow.window() }),
     service,
-    onPetEvent: (kind, ...args) => controller.petEvent(kind, ...args)
+    onPetEvent: (kind, ...args) => controller.petEvent(kind, ...args),
+    // Which window a chat signal came from (an Ask-window `done` badges the pet).
+    signalSource: (event) => {
+      const ask = askWindow.window();
+      return ask && event?.sender === ask.webContents ? 'ask' : 'main';
+    }
   });
 
   // --- Hand-off to the native pet (N1) ---
@@ -559,6 +583,15 @@ export function createPetsRuntime(options) {
   /** Refresh run turned into a normal start by a second instance. */
   let promoted = false;
   let started = false;
+  /** The last app window closed while the renderer was still pending. */
+  let handOffWhenNative = false;
+  /**
+   * The last app window closed while an update install was armed: 'main'
+   * (the main window closed meanwhile) or 'app' (only ask / store, or a
+   * hidden start). Replayed by `installCancelled`.
+   * @type {null|'main'|'app'}
+   */
+  let heldClose = null;
 
   async function refreshFactsAhead() {
     try {
@@ -595,7 +628,9 @@ export function createPetsRuntime(options) {
         resolvePath: timelineSpritePath,
         nowMs,
         environment,
-        secondSide: renderer.secondSide()
+        secondSide: renderer.secondSide(),
+        // v2 + round-3 fields only for a pet that lists them (ready.caps).
+        caps: nativePet?.caps() ?? null
       });
       const path = join(userDataDir, TIMELINE_FILE);
       const tmp = `${path}.${process.pid}.tmp`;
@@ -614,14 +649,27 @@ export function createPetsRuntime(options) {
    * @returns {Promise<boolean>}
    */
   async function handOffAndQuit() {
-    if (!nativePet || renderer.kind() !== 'native' || handingOff) return false;
+    if (!nativePet || renderer.kind() !== 'native') return false;
+    if (handingOff || handedOff) return false;
     handingOff = true;
     const path = writeTimeline();
     const ok = path ? await nativePet.handoff(path) : false;
     handingOff = false;
+    // A real Quit meanwhile stops the pet itself (beforeQuit).
+    if (lifecycle.isQuitting()) return false;
     if (!ok) {
       renderer.fallback('handoff-failed');
       tray.ensure();
+      return false;
+    }
+    if (!noAppWindows() || holdClose('app')) {
+      // A window opened (or an update install was armed) during the
+      // hand-off: keep driving the pet.
+      if (!nativePet.resume()) {
+        void nativePet.start().then((result) => {
+          if (!result.ok) renderer.fallback(result.reason ?? 'handoff-failed');
+        });
+      }
       return false;
     }
     handedOff = true;
@@ -635,12 +683,54 @@ export function createPetsRuntime(options) {
   const noAppWindows = () =>
     !getMainWindow() && !askWindow.window() && !storeWindow.window();
 
+  /**
+   * An app window (main, ask, store) was destroyed. Once none is left and
+   * the app closes to the tray, the native pet carries on alone and Electron
+   * quits (N1); a renderer still starting decides when it settles.
+   */
+  function onAppWindowClosed() {
+    if (!started || lifecycle.isQuitting() || !noAppWindows()) return;
+    if (holdClose('app')) return;
+    if (!settings.get().closeToTray) return;
+    const kind = renderer.kind();
+    if (kind === 'native') void handOffAndQuit();
+    else if (kind === 'pending') handOffWhenNative = true;
+  }
+
+  /**
+   * An update install is armed (main.mjs `installWhenDownloaded`): the app
+   * stays, with no window (tray if enabled), until the download installs it
+   * or `installCancelled` replays the close. Handing off or quitting now
+   * would drop the install.
+   * @param {'main'|'app'} kind
+   */
+  function holdClose(kind) {
+    if (!options.installArmed?.() || lifecycle.isQuitting()) return false;
+    if (heldClose !== 'main') heldClose = kind;
+    if (settings.get().closeToTray) tray.ensure();
+    return true;
+  }
+
+  /** The main window is gone: close to the tray, or hand the pet over. */
+  function closeMain() {
+    const result = lifecycle.onMainWindowClosed();
+    if (result === 'tray') onAppWindowClosed();
+    return result;
+  }
+
   wired = true;
 
   let pageView = JSON.stringify(pageSettings(settings.get()));
+  /** The tray never shows positions; roaming (2a) saves one per walk. */
+  const trayView = (s) => JSON.stringify({ ...s, positions: null });
+  let lastTrayView = trayView(settings.get());
   function onSettingsChanged(next) {
     controller.refresh();
-    tray.refresh();
+    const nextTrayView = trayView(next);
+    if (nextTrayView !== lastTrayView) {
+      lastTrayView = nextTrayView;
+      tray.refresh();
+    }
     const view = JSON.stringify(pageSettings(next));
     if (view !== pageView) {
       pageView = view;
@@ -678,11 +768,8 @@ export function createPetsRuntime(options) {
       tray.refresh();
     },
 
-    /**
-     * @param {{ hidden: boolean, handOff?: boolean }} options handOff false =
-     *   a hidden start that must keep Electron (update install)
-     */
-    start({ hidden, handOff = true }) {
+    /** @param {{ hidden: boolean }} options */
+    start({ hidden }) {
       if (started) return;
       started = true;
       // What the native pet changed while Electron was gone (one writer).
@@ -743,12 +830,13 @@ export function createPetsRuntime(options) {
           if (kind !== 'native') return;
           void refreshFactsAhead();
           // A hidden start (login item on macOS, or the app started with
-          // --hidden) hands straight over: nothing of Electron is needed.
+          // --hidden) hands straight over: nothing of Electron is needed —
+          // unless an update install is waiting (held until it settles).
           if (
             hidden &&
-            handOff &&
             noAppWindows() &&
-            settings.get().closeToTray
+            settings.get().closeToTray &&
+            !holdClose('app')
           ) {
             await settle(scheduleReady, REFRESH_FETCH_MS);
             await settle(refreshFactsAhead(), REFRESH_FETCH_MS);
@@ -789,6 +877,9 @@ export function createPetsRuntime(options) {
       if (promoted) return 'promoted';
       if (!adopted.ok) return done('no-pet');
       await settle(schedule.start(), REFRESH_FETCH_MS);
+      // Promoted during the fetch: `start` found the schedule running, so it
+      // must keep its 24 h refresh.
+      if (promoted) return 'promoted';
       schedule.stop();
       await settle(refreshFactsAhead(), REFRESH_FETCH_MS);
       if (promoted) return 'promoted';
@@ -830,14 +921,27 @@ export function createPetsRuntime(options) {
 
     /**
      * The main window has been destroyed: close to tray as before — or, with
-     * the native pet drawing, hand it over and quit Electron (N1).
+     * the native pet drawing, hand it over and quit Electron (N1). While an
+     * update install is armed, 'held' until it installs or is cancelled.
      */
     onMainWindowClosed() {
-      const result = lifecycle.onMainWindowClosed();
-      if (result === 'tray' && renderer.kind() === 'native' && noAppWindows()) {
-        void handOffAndQuit();
-      }
-      return result;
+      if (holdClose('main')) return 'held';
+      return closeMain();
+    },
+
+    /**
+     * The armed update install was cancelled (no update, or the check or
+     * download failed): a close held meanwhile happens now, as it would
+     * have then — tray, hand-off or quit.
+     * @returns {'tray'|'quit'|'stay'|'app'|null} null = nothing was held
+     */
+    installCancelled() {
+      const kind = heldClose;
+      heldClose = null;
+      if (!kind || !noAppWindows()) return null;
+      if (kind === 'main') return closeMain();
+      onAppWindowClosed();
+      return 'app';
     },
     shouldQuitOnAllClosed: () => lifecycle.shouldQuitOnAllClosed(),
 

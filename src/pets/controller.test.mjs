@@ -5,7 +5,7 @@ import {
   MAX_TIMER_MS,
   QUIET_HOUR_MS
 } from './controller.mjs';
-import { AMBIENT_WAITING_MS } from './behaviour.mjs';
+import { AMBIENT_SLEEP_MS, AMBIENT_WAITING_MS } from './behaviour.mjs';
 import {
   BUBBLE_MS,
   CHAT_SIGNAL_TTL_MS,
@@ -53,6 +53,8 @@ function fakeSettings(overrides = {}) {
     ...DEFAULT_SETTINGS,
     enabled: true,
     activePetId: 'petdex:lando',
+    // Greetings depend on the local clock (greeting.test.mjs covers them).
+    greetings: false,
     ...overrides
   };
   return {
@@ -214,6 +216,13 @@ describe('timers (fake clock)', () => {
     expect(clock.pending()).toEqual([T0 + AMBIENT_WAITING_MS]);
     clock.advance(AMBIENT_WAITING_MS);
     expect(last().state).toBe('waiting');
+    expect(clock.pending()).toEqual([T0 + AMBIENT_SLEEP_MS]);
+    clock.advance(AMBIENT_SLEEP_MS - AMBIENT_WAITING_MS);
+    expect(last()).toMatchObject({
+      state: 'idle',
+      still: true,
+      sleeping: true
+    });
     expect(clock.pending()).toEqual([]);
   });
 
@@ -276,8 +285,8 @@ describe('timers (fake clock)', () => {
     const { controller, clock } = setup({ sessions: [far] });
     controller.start();
     controller.signal('idle');
-    // ambient threshold first, then the capped calendar timer
-    clock.advance(AMBIENT_WAITING_MS);
+    // ambient thresholds first (waiting, sleep), then the capped calendar timer
+    clock.advance(AMBIENT_SLEEP_MS);
     expect(clock.pending()).toEqual([clock.now() + MAX_TIMER_MS]);
   });
 

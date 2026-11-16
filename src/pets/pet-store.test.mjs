@@ -10,7 +10,12 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createPetStore, encodeFolderName, parsePetId } from './pet-store.mjs';
+import {
+  createPetStore,
+  encodeFolderName,
+  parsePetId,
+  petFolderHomes
+} from './pet-store.mjs';
 import {
   fakeDecodeImage,
   fakeMakeThumb,
@@ -22,6 +27,7 @@ import {
 let root;
 let userDataDir;
 let codexHome;
+let petdexHome;
 let settings;
 let decodeCalls;
 
@@ -29,6 +35,7 @@ function makeStore(overrides = {}) {
   return createPetStore({
     userDataDir,
     codexHome,
+    petdexHome,
     decodeImage: (buf) => {
       decodeCalls++;
       return fakeDecodeImage(buf);
@@ -41,7 +48,16 @@ function makeStore(overrides = {}) {
 }
 
 function codexPet(folder, fields = {}, image = fakePng(1536, 1872)) {
-  const dir = join(codexHome, 'pets', folder);
+  return folderPet(codexHome, folder, fields, image);
+}
+
+/** A pet as `npx petdex install` leaves it in ~/.petdex/pets. */
+function cliPet(folder, fields = {}, image = fakePng(1536, 1872)) {
+  return folderPet(petdexHome, folder, fields, image);
+}
+
+function folderPet(home, folder, fields, image) {
+  const dir = join(home, 'pets', folder);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'pet.json'),
@@ -55,6 +71,7 @@ beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'tif1ai-pet-store-'));
   userDataDir = join(root, 'userData');
   codexHome = join(root, 'codex');
+  petdexHome = join(root, 'petdex');
   mkdirSync(userDataDir);
   settings = { scanCodexDir: true };
   decodeCalls = 0;
@@ -208,6 +225,110 @@ describe('pet store', () => {
     expect(store.get('codex:good%20pet')).toBeNull();
   });
 
+  test('Petdex CLI folder: listed read-only, never written, setting respected', () => {
+    const dir = cliPet(
+      'boba',
+      { spritesheetPath: 'spritesheet.webp' },
+      fakeWebp(1536, 2288)
+    );
+    cliPet('broken', {}, fakePng(100, 100));
+    const before = readdirSync(dir).sort();
+    const store = makeStore();
+    expect(store.list()).toEqual([
+      {
+        id: 'petdex-cli:boba',
+        source: 'petdex-cli',
+        displayName: 'boba',
+        description: 'A generated test pet.',
+        creator: null,
+        slug: null,
+        pageUrl: null,
+        thumb: 'data:image/png;base64,thumb-2',
+        removable: false
+      }
+    ]);
+    expect(store.get('petdex-cli:boba')).toMatchObject({
+      source: 'petdex-cli',
+      dir,
+      mime: 'image/webp',
+      atlas: { version: 2, rows: 11 }
+    });
+    expect(store.resolveAsset('petdex-cli:boba')).toEqual({
+      path: join(dir, 'spritesheet.webp'),
+      mime: 'image/webp'
+    });
+    expect(store.remove('petdex-cli:boba')).toEqual({
+      ok: false,
+      error: 'Petdex CLI pets are managed by Petdex.'
+    });
+    // The same folder name never resolves in the other root.
+    expect(store.get('codex:boba')).toBeNull();
+    expect(readdirSync(dir).sort()).toEqual(before);
+
+    settings = { scanCodexDir: false };
+    expect(store.list()).toEqual([]);
+    expect(store.get('petdex-cli:boba')).toBeNull();
+  });
+
+  test('one install in both folders is listed once, as the Petdex CLI copy', () => {
+    // `npx petdex install` writes identical bytes into both folders.
+    cliPet('boba');
+    codexPet('boba');
+    // Same name, different sheet: two different pets.
+    cliPet('lando', {}, fakePng(1536, 1872, 1));
+    codexPet('lando', {}, fakePng(1536, 1872, 2));
+    // Same sheet, different folder names: not the same install.
+    codexPet('boba-copy');
+    const store = makeStore();
+    expect(store.list().map((p) => p.id)).toEqual([
+      'petdex-cli:boba',
+      'petdex-cli:lando',
+      'codex:boba-copy',
+      'codex:lando'
+    ]);
+    // An id saved before (codex:<folder>) still resolves.
+    expect(store.get('codex:boba')?.dir).toBe(join(codexHome, 'pets', 'boba'));
+    expect(store.getListed('codex:boba')?.id).toBe('codex:boba');
+  });
+
+  test('a duplicate in use keeps its own id in the list', () => {
+    cliPet('boba');
+    codexPet('boba');
+    const store = makeStore();
+    settings = { scanCodexDir: true, activePetId: 'codex:boba' };
+    expect(store.list().map((p) => p.id)).toEqual(['codex:boba']);
+    settings = { scanCodexDir: true, secondPetId: 'codex:boba' };
+    expect(store.list().map((p) => p.id)).toEqual(['codex:boba']);
+    settings = {
+      scanCodexDir: true,
+      activePetId: 'petdex-cli:boba',
+      secondPetId: 'codex:boba'
+    };
+    expect(store.list().map((p) => p.id)).toEqual([
+      'petdex-cli:boba',
+      'codex:boba'
+    ]);
+    settings = { scanCodexDir: true, activePetId: 'petdex-cli:boba' };
+    expect(store.list().map((p) => p.id)).toEqual(['petdex-cli:boba']);
+  });
+
+  test('folder homes: $CODEX_HOME is honoured, ~/.petdex always', () => {
+    expect(petFolderHomes({ env: {}, homeDir: '/home/u' })).toEqual({
+      codexHome: join('/home/u', '.codex'),
+      petdexHome: join('/home/u', '.petdex')
+    });
+    // The Petdex CLI reads no $PETDEX_HOME (petdex-cli bin/petdex.ts).
+    expect(
+      petFolderHomes({
+        env: { CODEX_HOME: '/opt/codex', PETDEX_HOME: '/opt/petdex' },
+        homeDir: '/home/u'
+      })
+    ).toEqual({
+      codexHome: '/opt/codex',
+      petdexHome: join('/home/u', '.petdex')
+    });
+  });
+
   test('missing codex home is fine', () => {
     expect(
       createPetStore({
@@ -247,6 +368,11 @@ describe('pet store', () => {
       source: 'codex',
       key: 'my%20pet'
     });
+    expect(parsePetId('petdex-cli:boba')).toEqual({
+      source: 'petdex-cli',
+      key: 'boba'
+    });
+    expect(parsePetId('petdex-cli:%2E%2E')).toBeNull();
     expect(parsePetId('codex:%2E%2E')).toBeNull();
     expect(parsePetId('codex:a%2Fb')).toBeNull();
     expect(parsePetId('import:not-a-uuid')).toBeNull();

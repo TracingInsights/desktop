@@ -18,16 +18,21 @@ import {
   DEFAULT_SETTINGS,
   PAGE_WRITABLE_SETTINGS,
   PET_SIZES,
+  PET_SOURCES,
   SESSION_REACTIONS
 } from './contract.mjs';
 
 export const SETTINGS_FILE = 'pets-settings.json';
 
-const PET_ID_RE = /^(petdex|codex|import):[A-Za-z0-9._%-]{1,200}$/;
+const PET_ID_RE = new RegExp(
+  `^(${PET_SOURCES.join('|')}):[A-Za-z0-9._%-]{1,200}$`
+);
 /** f1db driver id ("max-verstappen"). */
 const DRIVER_ID_RE = /^[a-z0-9-]{1,64}$/;
 /** Local calendar day "2026-11-06" (daily-fact marker). */
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+/** Local day part "2026-11-06:morning" (greeting marker, greeting.mjs). */
+const DAY_PART_RE = /^\d{4}-\d{2}-\d{2}:(morning|evening)$/;
 const MAX_POSITIONS = 32;
 const MAX_MARKER_CHARS = 120;
 
@@ -44,6 +49,7 @@ const FIELD_VALIDATORS = {
   size: (v) => typeof v === 'string' && Object.hasOwn(PET_SIZES, v),
   chatReactions: isBool,
   sessionReactions: (v) => SESSION_REACTIONS.includes(v),
+  roam: isBool,
   quietUntil: (v) => v === null || isIsoTimestamp(v),
   closeToTray: isBool,
   launchAtLogin: isBool,
@@ -59,14 +65,18 @@ const FIELD_VALIDATORS = {
   onboardingShown: isBool,
   lastResultKey: isMarker,
   lastRateKey: isMarker,
-  lastFactDay: (v) => v === null || (typeof v === 'string' && DAY_RE.test(v))
+  lastFactDay: (v) => v === null || (typeof v === 'string' && DAY_RE.test(v)),
+  greetings: isBool,
+  lastGreetingKey: (v) =>
+    v === null || (typeof v === 'string' && DAY_PART_RE.test(v))
 };
 
 /** Internal once-only markers: main-process writes only, never shown to the page. */
 export const MARKER_SETTINGS = Object.freeze([
   'lastResultKey',
   'lastRateKey',
-  'lastFactDay'
+  'lastFactDay',
+  'lastGreetingKey'
 ]);
 
 /** @param {unknown} id f1db driver id */
@@ -291,9 +301,9 @@ export function createPetsSettings({ userDataDir }) {
       return guarded(() => commit({ ...current, onboardingShown: true }));
     },
     /**
-     * Record a once-only moment (result reaction / rate nudge / daily fact)
-     * so it never shows again, across restarts too.
-     * @param {'lastResultKey'|'lastRateKey'|'lastFactDay'} name
+     * Record a once-only moment (result reaction / rate nudge / daily fact /
+     * greeting) so it never shows again, across restarts too.
+     * @param {'lastResultKey'|'lastRateKey'|'lastFactDay'|'lastGreetingKey'} name
      * @param {string} value
      */
     setMarker(name, value) {

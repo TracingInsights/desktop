@@ -107,7 +107,7 @@ describe('createFacts', () => {
         return respond(url);
       },
       userDataDir: root,
-      appUrl: 'https://app.tracinginsights.com',
+      appUrl: 'https://tracinginsights.com',
       now: () => clock,
       setTimeout: () => 0,
       clearTimeout: () => {}
@@ -129,7 +129,7 @@ describe('createFacts', () => {
     expect(facts.today()).toBeNull(); // in flight: no second request
     await facts.settled();
     expect(calls.map((c) => c.url)).toEqual([
-      'https://app.tracinginsights.com/stats/data/on-this-day/nov-06.json'
+      'https://tracinginsights.com/stats/data/on-this-day/nov-06.json'
     ]);
     expect(changes).toBe(1);
     expect(facts.today()).toEqual({
@@ -252,7 +252,7 @@ describe('createFacts', () => {
         );
       },
       userDataDir: root,
-      appUrl: 'https://app.tracinginsights.com',
+      appUrl: 'https://tracinginsights.com',
       now: () => clock,
       setTimeout: (fn, ms) => {
         timers.push({ fn, ms });

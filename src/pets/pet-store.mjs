@@ -2,13 +2,15 @@
  * Desktop pets — installed-pet store (docs/DESKTOP_PETS_PLAN.md §4.2, D6).
  *
  * Own pets live in `userData/pets/<source>-<slug|uuid>/` (pet.json,
- * spritesheet.webp|png, source.json). The Codex folder (`<codexHome>/pets`)
- * is scanned read-only on every `list()` and never written. Every pet, own
- * or Codex, passes `validatePet` before it is listed or served; symlinks are
- * skipped. Installs go to a temp dir and are renamed into place, so a failed
- * install leaves nothing behind.
+ * spritesheet.webp|png, source.json). The folders other apps install into —
+ * Codex (`<codexHome>/pets`, ids `codex:<folder>`) and the Petdex CLI /
+ * Petdex Desktop (`~/.petdex/pets`, ids `petdex-cli:<folder>`) — are scanned
+ * read-only on every `list()` (when `scanCodexDir`) and never written. Every
+ * pet, own or folder, passes `validatePet` before it is listed or served;
+ * symlinks are skipped. Installs go to a temp dir and are renamed into
+ * place, so a failed install leaves nothing behind.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   existsSync,
   lstatSync,
@@ -31,6 +33,26 @@ const CODEX_ID_RE = /^[A-Za-z0-9._%-]{1,200}$/;
 const MAX_TAGS = 20;
 const MAX_TAG_CHARS = 40;
 const MAX_CREATOR_CHARS = 80;
+/** Read-only folder sources, in list order (duplicates keep the first). */
+const FOLDER_SOURCES = Object.freeze(['petdex-cli', 'codex']);
+
+/** A pet from a folder another app owns (never written or removed). */
+const isFolderSource = (source) => FOLDER_SOURCES.includes(source);
+
+/**
+ * The read-only pet folders' homes: `$CODEX_HOME` (else `~/.codex`) and
+ * `~/.petdex`. `npx petdex install` and Petdex Desktop write
+ * `<home>/.petdex/pets/<slug>/` from the home directory (petdex-cli
+ * `bin/petdex.ts` installOne, petdex-desktop-native `installer.zig`): neither
+ * reads a $PETDEX_HOME, so neither do we.
+ * @param {{ env: Record<string, string|undefined>, homeDir: string }} input
+ */
+export function petFolderHomes({ env, homeDir }) {
+  return {
+    codexHome: env.CODEX_HOME || join(homeDir, '.codex'),
+    petdexHome: join(homeDir, '.petdex')
+  };
+}
 
 /** @param {unknown} v @param {number} max */
 function capText(v, max) {
@@ -91,7 +113,7 @@ function decodeFolderToken(token) {
 /**
  * Parse a pet id into its source and folder location.
  * @param {unknown} id
- * @returns {{ source: 'petdex'|'import'|'codex', key: string } | null}
+ * @returns {{ source: 'petdex'|'import'|'codex'|'petdex-cli', key: string } | null}
  */
 export function parsePetId(id) {
   if (typeof id !== 'string') return null;
@@ -101,7 +123,7 @@ export function parsePetId(id) {
   const key = id.slice(colon + 1);
   if (source === 'petdex' && SLUG_RE.test(key)) return { source, key };
   if (source === 'import' && UUID_RE.test(key)) return { source, key };
-  if (source === 'codex' && decodeFolderToken(key) !== null) {
+  if (isFolderSource(source) && decodeFolderToken(key) !== null) {
     return { source, key };
   }
   return null;
@@ -147,23 +169,29 @@ function sanitiseMeta(source, slug, meta = {}) {
  * @param {{
  *   userDataDir: string,
  *   codexHome: string|null,
+ *   petdexHome?: string|null,
  *   decodeImage: (buf: Uint8Array) => { width: number, height: number } | null,
  *   makeThumb: (imageBuf: Buffer, atlas: object) => string,
- *   getSettings: () => { scanCodexDir: boolean },
+ *   getSettings: () => { scanCodexDir: boolean, activePetId?: string|null, secondPetId?: string|null },
  *   now?: () => number
  * }} options
  */
 export function createPetStore({
   userDataDir,
   codexHome,
+  petdexHome = null,
   decodeImage,
   makeThumb,
   getSettings,
   now = Date.now
 }) {
   const ownRoot = join(userDataDir, PETS_DIR);
-  const codexRoot = codexHome ? join(codexHome, 'pets') : null;
-  /** dir → { stamp, record, listed } */
+  /** Read-only roots by folder source. */
+  const folderRoots = {
+    'petdex-cli': petdexHome ? join(petdexHome, 'pets') : null,
+    codex: codexHome ? join(codexHome, 'pets') : null
+  };
+  /** dir → { stamp, record, listed, spriteHash } */
   const cache = new Map();
 
   function thumbFor(imageBuf, atlas) {
@@ -202,10 +230,9 @@ export function createPetStore({
       return null;
     }
     if (!imageStat.isFile() || imageStat.size > LIMITS.imageBytes) return null;
-    const sourceFile =
-      source === 'codex'
-        ? null
-        : readRegularFile(join(dir, 'source.json'), 64 * 1024);
+    const sourceFile = isFolderSource(source)
+      ? null
+      : readRegularFile(join(dir, 'source.json'), 64 * 1024);
     const stamp = [
       petJson.mtimeMs,
       petJson.size,
@@ -274,9 +301,13 @@ export function createPetStore({
       slug: meta.slug,
       pageUrl: meta.pageUrl,
       thumb: thumbFor(image.data, pet.atlas),
-      removable: source !== 'codex'
+      removable: !isFolderSource(source)
     };
-    const entry = { stamp, record, listed };
+    // Folder duplicates are told apart by their sheet bytes (listFolders).
+    const spriteHash = isFolderSource(source)
+      ? createHash('sha256').update(image.data).digest('hex')
+      : null;
+    const entry = { stamp, record, listed, spriteHash };
     cache.set(dir, entry);
     return entry;
   }
@@ -288,10 +319,11 @@ export function createPetStore({
   function locate(id) {
     const parsed = parsePetId(id);
     if (!parsed) return null;
-    if (parsed.source === 'codex') {
-      if (!codexRoot || !getSettings().scanCodexDir) return null;
+    if (isFolderSource(parsed.source)) {
+      const root = folderRoots[parsed.source];
+      if (!root || !getSettings().scanCodexDir) return null;
       const name = decodeFolderToken(parsed.key);
-      return name ? { ...parsed, dir: join(codexRoot, name) } : null;
+      return name ? { ...parsed, dir: join(root, name) } : null;
     }
     return { ...parsed, dir: ownDirFor(parsed.source, parsed.key) };
   }
@@ -316,13 +348,19 @@ export function createPetStore({
     return pets;
   }
 
-  function listCodex() {
-    /** @type {object[]} */
+  /**
+   * Valid pets in one read-only folder root, sorted by folder name.
+   * @param {'petdex-cli'|'codex'} source
+   * @returns {{ name: string, loaded: { listed: object, spriteHash: string|null } }[]}
+   */
+  function scanFolder(source) {
+    const root = folderRoots[source];
+    /** @type {{ name: string, loaded: any }[]} */
     const pets = [];
-    if (!codexRoot || !getSettings().scanCodexDir) return pets;
+    if (!root) return pets;
     let entries;
     try {
-      entries = readdirSync(codexRoot, { withFileTypes: true });
+      entries = readdirSync(root, { withFileTypes: true });
     } catch {
       return pets;
     }
@@ -331,13 +369,42 @@ export function createPetStore({
       const token = encodeFolderName(entry.name);
       if (!CODEX_ID_RE.test(token)) continue;
       const loaded = loadDir(
-        `codex:${token}`,
-        'codex',
-        join(codexRoot, entry.name)
+        `${source}:${token}`,
+        source,
+        join(root, entry.name)
       );
-      if (loaded) pets.push(loaded.listed);
+      if (loaded) pets.push({ name: entry.name, loaded });
     }
     return pets;
+  }
+
+  /**
+   * Folder pets (when scanCodexDir), Petdex CLI first. The Petdex CLI writes
+   * one install into both folders, so a Codex pet with the same folder name
+   * and the same spritesheet bytes as a Petdex CLI pet is listed once — as
+   * the Petdex CLI copy, unless only the Codex id is in use (active or duo
+   * pet), so a choice saved before both folders were read stays marked.
+   * Every id still resolves through `get` either way.
+   */
+  function listFolders() {
+    const current = getSettings();
+    if (!current.scanCodexDir) return [];
+    const inUse = new Set([current.activePetId, current.secondPetId]);
+    const cli = scanFolder('petdex-cli');
+    const codex = scanFolder('codex');
+    const codexByName = new Map(codex.map((pet) => [pet.name, pet]));
+    const hidden = new Set();
+    for (const pet of cli) {
+      const twin = codexByName.get(pet.name);
+      if (!twin || twin.loaded.spriteHash !== pet.loaded.spriteHash) continue;
+      const cliUsed = inUse.has(pet.loaded.listed.id);
+      const codexUsed = inUse.has(twin.loaded.listed.id);
+      if (cliUsed && codexUsed) continue;
+      hidden.add(codexUsed ? pet : twin);
+    }
+    return [...cli, ...codex]
+      .filter((pet) => !hidden.has(pet))
+      .map((pet) => pet.loaded.listed);
   }
 
   function get(id) {
@@ -347,9 +414,9 @@ export function createPetStore({
   }
 
   return {
-    /** Own pets first, then Codex-folder pets (when scanCodexDir). */
+    /** Own pets first, then the folder pets (when scanCodexDir). */
     list() {
-      return [...listOwn(), ...listCodex()];
+      return [...listOwn(), ...listFolders()];
     },
     /** @param {string} id */
     get,
@@ -429,7 +496,7 @@ export function createPetStore({
       return { ok: true, pet: listed };
     },
     /**
-     * Delete an own pet (Codex-folder pets are never removable).
+     * Delete an own pet (folder pets — Codex, Petdex CLI — are never removable).
      * @param {string} id
      * @returns {{ ok: true } | { ok: false, error: string }}
      */
@@ -438,6 +505,9 @@ export function createPetStore({
       if (!parsed) return { ok: false, error: 'Unknown pet.' };
       if (parsed.source === 'codex') {
         return { ok: false, error: 'Codex pets are managed by Codex.' };
+      }
+      if (isFolderSource(parsed.source)) {
+        return { ok: false, error: 'Petdex CLI pets are managed by Petdex.' };
       }
       const dir = ownDirFor(parsed.source, parsed.key);
       if (!isRealDir(dir)) return { ok: false, error: 'Unknown pet.' };

@@ -9,11 +9,16 @@
  * - `pet:*` (PET_WINDOW_CHANNELS): one-way events from the bundled pet page.
  *   Accepted only from the pet window's webContents on `app://pet/`;
  *   anything else is dropped silently.
+ * - `pets:signal` also says which window sent it (`signalSource`): an Ask-
+ *   window `done` can badge the pet (round 3, 3b).
  */
 import {
+  BUBBLE_ACTION_IDS,
   CELEBRATE_KINDS,
   CELEBRATE_TEXT_CHARS,
   CHAT_SIGNALS,
+  PANEL_ACTION_IDS,
+  PANEL_CLOSE_ID,
   PET_PAGE_SCHEME,
   PET_WINDOW_CHANNELS,
   PETDEX_SEARCH_MAX_LIMIT,
@@ -143,6 +148,24 @@ export function validateCelebrateInput(input) {
   return { ok: true, value: { kind: input.kind, text: input.text } };
 }
 
+/** `pet:panelAction` ids: the panel's buttons plus the renderer's close. */
+const PANEL_EVENT_IDS = Object.freeze([...PANEL_ACTION_IDS, PANEL_CLOSE_ID]);
+
+/**
+ * A pet-window button event: exactly `{ id }` with an id from `ids`.
+ * @param {unknown} input
+ * @param {readonly string[]} ids
+ * @returns {string|null} the id, or null (dropped)
+ */
+export function validateActionId(input, ids) {
+  if (!isPlainObject(input)) return null;
+  const keys = Object.keys(input);
+  if (keys.length !== 1 || keys[0] !== 'id') return null;
+  return typeof input.id === 'string' && ids.includes(input.id)
+    ? input.id
+    : null;
+}
+
 /**
  * @param {{
  *   ipcMain: { handle: Function, on: Function },
@@ -154,12 +177,13 @@ export function validateCelebrateInput(input) {
  *     install: (slug: string) => Promise<object>, importPet: () => Promise<object>,
  *     remove: (id: string) => Promise<object>|object, setActive: (id: string|null) => Promise<object>|object,
  *     updateSettings: (patch: object) => Promise<object>|object, quiet: (kind: string) => Promise<object>|object,
- *     signal: (state: string) => object, restartApp: () => object,
+ *     signal: (state: string, from: 'ask'|'main'|null) => object, restartApp: () => object,
  *     setFavorite: (driverId: string|null) => Promise<object>, setSecondPet: (id: string|null) => Promise<object>,
  *     celebrate: (input: { kind: string, text: string }) => object, onboardingDone: () => object,
  *     openAsk: () => Promise<object>
  *   },
  *   onPetEvent: (kind: string, ...args: unknown[]) => void,
+ *   signalSource?: (event: object) => 'ask'|'main'|null,
  *   log?: (message: string, error?: unknown) => void
  * }} deps
  */
@@ -169,14 +193,20 @@ export function createPetsIpc({
   isPetSender,
   service,
   onPetEvent,
+  signalSource = () => null,
   log = console.warn
 }) {
   function handle(channel, handler) {
+    handleEvent(channel, (_event, ...args) => handler(...args));
+  }
+
+  /** Like `handle`, but the handler also gets the (trusted) event first. */
+  function handleEvent(channel, handler) {
     ipcMain.handle(channel, async (event, ...args) => {
       if (!isTrustedSender(event))
         return fail('Pets are not available from this page.');
       try {
-        return await handler(...args);
+        return await handler(event, ...args);
       } catch (error) {
         log(`[pets] ${channel} failed:`, error);
         return fail(error instanceof Error ? error.message : String(error));
@@ -236,9 +266,9 @@ export function createPetsIpc({
           ? service.quiet(kind)
           : fail('Unknown quiet option.')
       );
-      handle(PETS_CHANNELS.signal, (state) =>
+      handleEvent(PETS_CHANNELS.signal, (event, state) =>
         CHAT_SIGNALS.includes(state)
-          ? service.signal(state)
+          ? service.signal(state, signalSource(event))
           : fail('Unknown signal.')
       );
       handle(PETS_CHANNELS.restartApp, () => service.restartApp());
@@ -279,6 +309,14 @@ export function createPetsIpc({
       ]) {
         on(PET_WINDOW_CHANNELS[kind], () => onPetEvent(kind));
       }
+      on(PET_WINDOW_CHANNELS.bubbleAction, (input) => {
+        const id = validateActionId(input, BUBBLE_ACTION_IDS);
+        if (id) onPetEvent('bubbleAction', id);
+      });
+      on(PET_WINDOW_CHANNELS.panelAction, (input) => {
+        const id = validateActionId(input, PANEL_EVENT_IDS);
+        if (id) onPetEvent('panelAction', id);
+      });
     },
 
     /**

@@ -35,7 +35,7 @@ export function pageSettings(settings) {
  *   store: { list: () => object[], get: (id: string) => object|null, getListed: (id: string) => object|null, remove: (id: string) => { ok: boolean, error?: string } },
  *   petdex: { search: (i: object) => Promise<object>, shelf: (i: object) => Promise<object>, thumbs: (slugs: string[]) => Promise<object>, install: (slug: string) => Promise<object> },
  *   importer: { importPet: () => Promise<object>, importPath: (path: string) => Promise<object> },
- *   controller: { quiet: (kind: string) => object, signal: (s: string) => object, celebrate: (kind: string, text: string) => object, assetsChanged: () => void },
+ *   controller: { quiet: (kind: string) => object, signal: (s: string, from?: 'ask'|'main'|null) => object, celebrate: (kind: string, text: string) => object, assetsChanged: () => void },
  *   thumbs: { thumbFor: (record: object|null) => Promise<string> },
  *   support: () => { supported: boolean, unsupportedReason: string|null, needsRestartForPets: boolean },
  *   platform: string,
@@ -110,13 +110,17 @@ export function createPetsService(deps) {
   }
 
   // Chat signals: ≤ SIGNALS_PER_SECOND; over the limit the latest one is
-  // applied when the window frees up, so a final `done` is never lost.
+  // applied when the window frees up, so a final `done` is never lost (nor
+  // the window it came from: an Ask-window `done` may badge the pet).
   let windowStart = 0;
   let inWindow = 0;
   let pendingSignal = null;
+  /** @type {'ask'|'main'|null} */
+  let pendingFrom = null;
   let pendingTimer = null;
 
-  function applySignal(state) {
+  /** @param {string} state @param {'ask'|'main'|null} [from] */
+  function applySignal(state, from = null) {
     const t = now();
     if (t - windowStart >= 1000) {
       windowStart = t;
@@ -124,16 +128,19 @@ export function createPetsService(deps) {
     }
     if (inWindow < SIGNALS_PER_SECOND) {
       inWindow += 1;
-      return controller.signal(state);
+      return controller.signal(state, from);
     }
     pendingSignal = state;
+    pendingFrom = from;
     if (!pendingTimer) {
       pendingTimer = setTimer(
         () => {
           pendingTimer = null;
           const next = pendingSignal;
+          const nextFrom = pendingFrom;
           pendingSignal = null;
-          if (next) applySignal(next);
+          pendingFrom = null;
+          if (next) applySignal(next, nextFrom);
         },
         Math.max(0, windowStart + 1000 - t)
       );
@@ -193,6 +200,14 @@ export function createPetsService(deps) {
     }
     const id = `petdex:${slug}`;
     const latest = settings.get();
+    // The install took a while: a newer favourite (or none), or a pet the
+    // user picked meanwhile, wins over this one.
+    if (
+      latest.favoriteDriverId !== driverId ||
+      latest.activePetId !== current.activePetId
+    ) {
+      return { ok: true };
+    }
     /** @type {Record<string, unknown>} */
     const patch = { activePetId: id };
     if (latest.activePetId === null) patch.enabled = true;
@@ -351,7 +366,8 @@ export function createPetsService(deps) {
       return status();
     },
 
-    signal: (state) => applySignal(state),
+    /** @param {string} state @param {'ask'|'main'|null} [from] the sending window */
+    signal: (state, from = null) => applySignal(state, from),
 
     restartApp() {
       restartApp();

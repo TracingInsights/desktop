@@ -157,7 +157,10 @@ export function createThumbRenderer({
   idleMs = THUMB_IDLE_MS,
   timeoutMs = THUMB_TIMEOUT_MS
 }) {
-  /** hash → data URL ('' = could not render; not retried until the bytes change) */
+  /**
+   * hash → data URL ('' = the page could not draw these bytes; not retried
+   * until they change). A thrown render (timeout, window gone) is not cached.
+   */
   const cache = new Map();
   let win = null;
   let ready = null;
@@ -230,13 +233,16 @@ export function createThumbRenderer({
           createHash('sha256').update(bytes).digest('hex') +
           JSON.stringify(thumbGeometry(record.atlas));
         if (cache.has(key)) return cache.get(key);
+        // The last job's idle timer must not dispose the window mid-render.
+        if (idleTimer) clearTimer(idleTimer);
+        idleTimer = null;
         let result;
         try {
           const out = await renderOnce(bytes, record.atlas);
           result = isThumbDataUrl(out) ? out : '';
         } catch {
-          result = '';
           dispose();
+          return '';
         }
         if (cache.size >= THUMB_CACHE_MAX)
           cache.delete(cache.keys().next().value);

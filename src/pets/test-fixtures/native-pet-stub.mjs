@@ -5,6 +5,9 @@
  * gets to $STUB_LOG and answers `handoff` with `ack`, `quit` by exiting.
  *
  *   STUB_EVENTS=1  after `ready`, send a `position` then an `event click`
+ *   STUB_ROUND3=1  after `ready`, send a bubbleAction, a panelAction close
+ *                  and a walk's `position` (round 3)
+ *   STUB_CAPS=a,b  `ready.caps` (default `duo`, like an old pet)
  *   STUB_CRASH=1   exit right after `ready` (crash-loop tests)
  */
 import { appendFileSync, chmodSync, readFileSync, rmSync } from 'node:fs';
@@ -48,8 +51,11 @@ const server = createServer((conn) => {
           return;
         }
         hello = true;
+        const caps = (process.env.STUB_CAPS ?? 'duo')
+          .split(',')
+          .filter(Boolean);
         conn.write(
-          `${JSON.stringify({ kind: 'ready', protocol: 1, version: 'stub', caps: ['duo'], pid: process.pid })}\n`
+          `${JSON.stringify({ kind: 'ready', protocol: 1, version: 'stub', caps, pid: process.pid })}\n`
         );
         if (process.env.STUB_CRASH === '1')
           setTimeout(() => process.exit(3), 50);
@@ -61,6 +67,22 @@ const server = createServer((conn) => {
           conn.write(
             `${JSON.stringify({ kind: 'menuAction', id: 'tray.open-tracinginsights' })}\n`
           );
+        }
+        if (process.env.STUB_ROUND3 === '1') {
+          for (const message of [
+            { kind: 'event', event: 'bubbleAction', id: 'mute' },
+            { kind: 'event', event: 'panelAction', id: 'close' },
+            {
+              kind: 'position',
+              x: 300,
+              y: 60,
+              displayId: 'd2',
+              secondSide: 'left',
+              walk: true
+            }
+          ]) {
+            conn.write(`${JSON.stringify(message)}\n`);
+          }
         }
         continue;
       }

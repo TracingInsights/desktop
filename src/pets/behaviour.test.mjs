@@ -1,5 +1,6 @@
 import { describe, test, expect } from 'bun:test';
 import {
+  AMBIENT_SLEEP_MS,
   AMBIENT_WAITING_MS,
   canStartMoment,
   computeBehaviour,
@@ -80,7 +81,7 @@ describe('computeBehaviour — ambient (row 6)', () => {
     );
     expect(out.state).toBe('waiting');
     expect(out.once).toBe(false);
-    expect(out.nextChangeAt).toBeNull();
+    expect(out.nextChangeAt).toBe(T0 + AMBIENT_SLEEP_MS);
   });
 
   test('on battery the ambient pose is a still frame', () => {
@@ -387,7 +388,7 @@ describe('computeBehaviour — calendar (row 5)', () => {
     const out = computeBehaviour(
       input({
         nowMs: now,
-        lastActivityAtMs: now - AMBIENT_WAITING_MS,
+        lastActivityAtMs: now - AMBIENT_SLEEP_MS,
         calendar: {
           phase: null,
           session: null,
@@ -395,7 +396,7 @@ describe('computeBehaviour — calendar (row 5)', () => {
         }
       })
     );
-    expect(out.state).toBe('waiting');
+    expect(out).toMatchObject({ state: 'idle', sleeping: true });
     expect(out.nextChangeAt).toBe(T0 - SESSION_LEAD_MS);
   });
 

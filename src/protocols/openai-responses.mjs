@@ -21,6 +21,7 @@
  */
 import {
   SseDecoder,
+  createStreamWatchdog,
   fetchWithValidatedRedirects,
   inferenceError,
   isReasoningParamError,
@@ -31,12 +32,6 @@ import {
 } from './shared.mjs';
 
 const PROTOCOL = 'openai-responses';
-
-function networkError(message) {
-  const err = new Error(message);
-  err.code = 'network';
-  return err;
-}
 
 /** Map the portable ReasoningLevel to a Responses `reasoning.effort`. */
 function mapResponsesEffort(level) {
@@ -85,55 +80,19 @@ async function callOnce({
   idleTimeoutMs,
   firstTokenTimeoutMs
 }) {
-  const timeoutController = new AbortController();
-  const combined = signal
-    ? AbortSignal.any([signal, timeoutController.signal])
-    : timeoutController.signal;
-
-  let idleTimer;
-  let firstTokenTimer;
-  const armIdle = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = null;
-    // The first-token grace governs until the first token arrives.
-    if (firstTokenTimer) return;
-    if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) return;
-    idleTimer = setTimeout(
-      () =>
-        timeoutController.abort(
-          networkError('Provider stream was idle for too long.')
-        ),
-      idleTimeoutMs
-    );
-  };
-  const armFirstToken = () => {
-    if (!Number.isFinite(firstTokenTimeoutMs) || firstTokenTimeoutMs <= 0)
-      return;
-    firstTokenTimer = setTimeout(
-      () =>
-        timeoutController.abort(
-          networkError('Timed out waiting for the first token.')
-        ),
-      firstTokenTimeoutMs
-    );
-  };
-  const clearFirst = () => {
-    if (firstTokenTimer) clearTimeout(firstTokenTimer);
-    firstTokenTimer = null;
-  };
-
-  // Watchdogs: the first-token grace (model cold-load) is armed BEFORE the
-  // request, so a hung connect / header wait / blocking (non-stream) call is
-  // bounded too. The idle watchdog only takes over once the first token has
-  // arrived — arming both at stream start let the shorter idle timeout fire
-  // during a legitimate cold load and pre-empt the grace period.
-  armFirstToken();
+  const watchdog = createStreamWatchdog({
+    signal,
+    idleTimeoutMs,
+    firstTokenTimeoutMs
+  });
+  const { armIdle, clearFirst } = watchdog;
+  watchdog.armFirstToken();
   try {
     const response = await fetchWithValidatedRedirects(fetchImpl, url, {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...headers },
       body: JSON.stringify(body),
-      signal: combined
+      signal: watchdog.signal
     });
 
     if (!response.ok) {
@@ -185,12 +144,16 @@ async function callOnce({
     const partText = new Map();
     const partKey = (payload) =>
       `${String(payload?.output_index ?? 0)}:${String(payload?.content_index ?? 0)}`;
+    // Reasoning counts as the first token too (as in openai-completions):
+    // the model is past its cold load, so the idle watchdog takes over.
+    const noteFirstToken = () => {
+      if (!firstToken) return;
+      firstToken = false;
+      clearFirst();
+    };
     const emit = (delta) => {
       if (!delta) return;
-      if (firstToken) {
-        firstToken = false;
-        clearFirst();
-      }
+      noteFirstToken();
       text += delta;
       onDelta?.(delta);
     };
@@ -209,6 +172,13 @@ async function callOnce({
           const key = partKey(payload);
           partText.set(key, (partText.get(key) ?? '') + delta);
           emit(delta);
+        }
+      } else if (
+        type === 'response.reasoning_text.delta' ||
+        type === 'response.reasoning_summary_text.delta'
+      ) {
+        if (typeof payload.delta === 'string' && payload.delta) {
+          noteFirstToken();
         }
       } else if (type === 'response.output_text.done') {
         // `.done` is the authoritative full text for the part; deltas should
@@ -264,8 +234,7 @@ async function callOnce({
       reader.releaseLock();
     }
   } finally {
-    clearTimeout(idleTimer);
-    clearFirst();
+    watchdog.dispose();
   }
 }
 

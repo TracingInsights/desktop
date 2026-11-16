@@ -12,7 +12,14 @@
     <script src="pet.js" defer></script>
   </head>
   <body>
-    <div id="bubble" role="status" aria-live="polite" hidden></div>
+    <div id="bubble" role="status" aria-live="polite" hidden>
+      <span id="bubble-text"></span>
+      <div id="bubble-actions" class="pet-actions" hidden></div>
+    </div>
+    <div id="panel" role="group" aria-label="Pet panel" hidden>
+      <div id="panel-lines" hidden></div>
+      <div id="panel-actions" class="pet-actions"></div>
+    </div>
     <div
       id="second"
       class="sprite"
@@ -21,5 +28,6 @@
       hidden
     ></div>
     <div id="pet" class="sprite" role="img" aria-label="Desktop pet"></div>
+    <span id="badge" role="status" hidden><span id="badge-text"></span></span>
   </body>
 </html>

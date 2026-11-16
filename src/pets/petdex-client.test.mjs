@@ -193,7 +193,7 @@ describe('search', () => {
       limit: '48'
     });
     expect(calls[0].init.headers['User-Agent']).toBe(
-      'TracingInsightsDesktop/0.2.0 (+https://app.tracinginsights.com)'
+      'TracingInsightsDesktop/0.2.0 (+https://tracinginsights.com)'
     );
     expect(calls[0].init.redirect).toBe('manual');
   });

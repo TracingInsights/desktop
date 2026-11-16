@@ -221,7 +221,7 @@ export function createPetdexClient({
   now = Date.now,
   timeoutMs = PETDEX_TIMEOUT_MS
 }) {
-  const userAgent = `TracingInsightsDesktop/${appVersion} (+https://app.tracinginsights.com)`;
+  const userAgent = `TracingInsightsDesktop/${appVersion} (+https://tracinginsights.com)`;
   const cachePath = join(userDataDir, MANIFEST_CACHE_FILE);
   /** @type {{ etag: string|null, fetchedAt: number, raw: any, parsed: NonNullable<ReturnType<typeof parseManifest>> } | null | undefined} */
   let manifestCache;

@@ -25,13 +25,18 @@
  *   (`onFailure('crash-loop')` → the runtime falls back to the Electron pet).
  * - The native pet moves its own window while dragging, so `moveBy` is a
  *   no-op here; `position` messages keep the last drop point for
- *   `savePosition` and the duo's `secondSide`.
+ *   `savePosition` and the duo's `secondSide`. A `position` with
+ *   `walk: true` (the end of a walk, round 3) is saved at once, like a drop.
+ * - Round 3: the pet's `ready.caps` decide what a render carries
+ *   (`toNativeRender`), what `can()` answers (`panel`, `badge`) and which
+ *   timeline version it gets (`caps()`, runtime.mjs).
  */
 import { randomBytes as nodeRandomBytes } from 'node:crypto';
 import { join, posix, win32 } from 'node:path';
 import {
   createLineDecoder,
   encodeLine,
+  NATIVE_CAPS,
   NATIVE_PROTOCOL_VERSION,
   nativeSocketPath,
   toNativeRender,
@@ -138,7 +143,7 @@ export async function isTrustedPipeServer({
  *   resolvePath: (spriteUrl: string) => string|null,
  *   getPosition: () => ({ x: number, y: number } | null),
  *   savePosition: (position: { x: number, y: number, displayId: string|null }) => void,
- *   onEvent: (event: string, dx?: number, dy?: number) => void,
+ *   onEvent: (event: string, ...args: any[]) => void,
  *   onMenuAction: (id: string, checked?: boolean) => void,
  *   onFailure: (reason: string) => void,
  *   spawn: (command: string, args: string[], options: object) => any,
@@ -203,6 +208,14 @@ export function createNativePet(deps) {
   /** Set once we told the native pet to go (quit) or to carry on alone (handoff). */
   let released = false;
   /**
+   * Bumped by every start / quit / detach: a connect still awaiting from
+   * before (a crash respawn) must not adopt the pet afterwards.
+   */
+  let generation = 0;
+  /** The `start()` calls, one at a time (each one rewrites `pet-token`). */
+  /** @type {Promise<unknown>} */
+  let starts = Promise.resolve();
+  /**
    * Connected but not driving: the pet keeps playing its timeline until the
    * first show / hide / render / menu (refresh mode never takes over).
    */
@@ -224,8 +237,12 @@ export function createNativePet(deps) {
   let shown = false;
   /** @type {null | { size: string, duo: boolean }} */
   let showOptions = null;
-  /** @type {object|null} */
-  let lastRender = null;
+  /**
+   * The controller's last payload: converted for the pet connected now
+   * (its caps may differ after a respawn or an adopt).
+   * @type {object|null}
+   */
+  let lastPayload = null;
   /** @type {object|null} */
   let lastMenu = null;
   /** @type {null | { x: number, y: number, displayId: string|null, secondSide: 'left'|'right' }} */
@@ -287,10 +304,24 @@ export function createNativePet(deps) {
     }
   }
 
+  /** The connected pet's caps (none before `ready`: ti-pet-v0.1.1's view). */
+  const peerCaps = () => peer?.caps ?? [];
+
+  /** The last payload as the connected pet takes it, or null. */
+  const nativeRender = () =>
+    lastPayload ? toNativeRender(lastPayload, resolvePath, peerCaps()) : null;
+
   function handle(message) {
     switch (message.kind) {
       case 'event':
-        onEvent(message.event, message.dx, message.dy);
+        if (message.event === 'drag') {
+          onEvent('drag', message.dx, message.dy);
+        } else if (typeof message.id === 'string') {
+          // bubbleAction / panelAction (validateFromNative checked the id).
+          onEvent(message.event, message.id);
+        } else {
+          onEvent(message.event);
+        }
         return;
       case 'position':
         position = {
@@ -299,6 +330,14 @@ export function createNativePet(deps) {
           displayId: message.displayId,
           secondSide: message.secondSide
         };
+        // A walk ended there: saved like a drop (no dragEnd follows).
+        if (message.walk) {
+          savePosition({
+            x: position.x,
+            y: position.y,
+            displayId: position.displayId
+          });
+        }
         return;
       case 'menuAction':
         onMenuAction(message.id, message.checked);
@@ -482,7 +521,8 @@ export function createNativePet(deps) {
     if (lastMenu) send({ kind: 'menu', ...lastMenu });
     if (shown && showOptions) {
       send({ kind: 'show', ...showOptions, position: getPosition() });
-      if (lastRender) send({ kind: 'render', payload: lastRender });
+      const render = nativeRender();
+      if (render) send({ kind: 'render', payload: render });
     } else {
       send({ kind: 'hide' });
     }
@@ -499,8 +539,15 @@ export function createNativePet(deps) {
   }
 
   async function establish({ allowSpawn }) {
+    const session = generation;
+    /** Quit / detach / a new start while we waited: leave the pet alone. */
+    const stale = () => session !== generation;
     let conn = await connectOnce();
     if (untrusted) return refuseUntrusted();
+    if (stale()) {
+      conn?.destroy?.();
+      return { ok: false, reason: 'released' };
+    }
     if (!conn && allowSpawn) {
       try {
         spawnNative();
@@ -510,6 +557,10 @@ export function createNativePet(deps) {
       }
       conn = await connectUntil(now() + connectTimeoutMs);
       if (untrusted) return refuseUntrusted();
+      if (stale()) {
+        conn?.destroy?.();
+        return { ok: false, reason: 'released' };
+      }
     }
     if (!conn) {
       return {
@@ -546,8 +597,41 @@ export function createNativePet(deps) {
       return;
     }
     void establish({ allowSpawn: true }).then((result) => {
-      if (!result.ok) fail(result.reason ?? 'connect-timeout');
+      if (!result.ok && result.reason !== 'released') {
+        fail(result.reason ?? 'connect-timeout');
+      }
     });
+  }
+
+  /** `start()` itself, run one at a time. */
+  async function startNow({ allowSpawn = true, takeOver: take = true } = {}) {
+    if (ready) {
+      released = false;
+      failed = false;
+      if (take && !takeOver) {
+        takeOver = true;
+        replay();
+      }
+      return { ok: true, reason: null };
+    }
+    takeOver = take;
+    failed = false;
+    released = false;
+    untrusted = false;
+    // A crash respawn still connecting must not adopt the pet as well.
+    generation += 1;
+    if (!binaryPath || !fs.existsSync(binaryPath)) {
+      return { ok: false, reason: 'not-bundled' };
+    }
+    try {
+      writeToken();
+    } catch (error) {
+      console.warn('[pets] native token:', error);
+      return { ok: false, reason: 'token-failed' };
+    }
+    const result = await establish({ allowSpawn });
+    if (!result.ok) failed = true;
+    return result;
   }
 
   return {
@@ -559,6 +643,16 @@ export function createNativePet(deps) {
     failed: () => failed,
     /** Pid of the native pet (from `ready`), for update installs. */
     peer: () => peer,
+    /** The pet's `ready.caps` (empty before it answered: v0.1.1's view). */
+    caps: () => [...peerCaps()],
+    /**
+     * Does the pet draw a round-3 feature the controller asks about
+     * (`'panel'`, `'badge'`; pet-renderer.mjs)? From its `ready.caps`.
+     * @param {string} feature
+     */
+    can: (feature) =>
+      Object.values(NATIVE_CAPS).includes(feature) &&
+      peerCaps().includes(feature),
 
     /** argv the native pet is started with (the login item reuses it). */
     launchArgs: () => nativeArgs(),
@@ -567,36 +661,27 @@ export function createNativePet(deps) {
      * Adopt a running pet or spawn one. `allowSpawn: false` = adopt only
      * (refresh mode: never start a pet nobody asked for); `takeOver: false`
      * = connect without driving it. Calling again while connected takes
-     * over (a refresh run the user turned into a normal start).
+     * over (a refresh run the user turned into a normal start). Calls run
+     * one after another: a second one waits for the first handshake.
      * @param {{ allowSpawn?: boolean, takeOver?: boolean }} [options]
      * @returns {Promise<{ ok: boolean, reason: string|null }>}
      */
-    async start({ allowSpawn = true, takeOver: take = true } = {}) {
-      if (ready) {
-        released = false;
-        failed = false;
-        if (take && !takeOver) {
-          takeOver = true;
-          replay();
-        }
-        return { ok: true, reason: null };
-      }
-      takeOver = take;
-      failed = false;
-      released = false;
-      untrusted = false;
-      if (!binaryPath || !fs.existsSync(binaryPath)) {
-        return { ok: false, reason: 'not-bundled' };
-      }
-      try {
-        writeToken();
-      } catch (error) {
-        console.warn('[pets] native token:', error);
-        return { ok: false, reason: 'token-failed' };
-      }
-      const result = await establish({ allowSpawn });
-      if (!result.ok) failed = true;
+    start(options) {
+      const result = starts.then(() => startNow(options));
+      starts = result.catch(() => {});
       return result;
+    },
+
+    /**
+     * Drive the pet again after a hand-off nobody followed (a window opened
+     * meanwhile): false when the connection is gone.
+     */
+    resume() {
+      if (!ready) return false;
+      released = false;
+      takeOver = true;
+      replay();
+      return true;
     },
 
     // --- petWindow interface (controller.mjs) ---
@@ -612,14 +697,14 @@ export function createNativePet(deps) {
     hide() {
       if (!shown) return;
       shown = false;
-      lastRender = null;
+      lastPayload = null;
       send({ kind: 'hide' });
     },
     /** @param {object} payload controller render payload */
     render(payload) {
-      const native = toNativeRender(payload, resolvePath);
+      const native = toNativeRender(payload, resolvePath, peerCaps());
       if (!native) return;
-      lastRender = native;
+      lastPayload = payload;
       if (showOptions) {
         showOptions = { size: native.size, duo: native.second !== null };
       }
@@ -688,6 +773,7 @@ export function createNativePet(deps) {
      */
     quit() {
       released = true;
+      generation += 1;
       if (!ready) return Promise.resolve();
       return new Promise((resolve) => {
         let done = false;
@@ -707,6 +793,7 @@ export function createNativePet(deps) {
     /** Drop the connection without telling the pet to exit (refresh mode end). */
     detach() {
       released = true;
+      generation += 1;
       ready = false;
       socket?.end?.();
       socket = null;

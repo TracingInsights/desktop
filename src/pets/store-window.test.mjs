@@ -117,7 +117,9 @@ function setup() {
   const fake = fakeElectron();
   const external = [];
   const imported = [];
+  const closed = [];
   const store = createPetStoreWindow({
+    onClosed: () => closed.push(true),
     BrowserWindow: fake.BrowserWindow,
     session: fake.session,
     Menu: fake.Menu,
@@ -125,7 +127,7 @@ function setup() {
     downloadDir: join(mkdtempSync(join(tmpdir(), 'tif1ai-store-')), 'dl'),
     onPetDownload: (path) => imported.push(path)
   });
-  return { ...fake, store, external, imported };
+  return { ...fake, store, external, imported, closed };
 }
 
 describe('createPetStoreWindow', () => {
@@ -154,6 +156,21 @@ describe('createPetStoreWindow', () => {
     );
     expect(granted).toBe(false);
     expect(external).toEqual([]);
+  });
+
+  test("closing notifies the runtime; a late 'closed' keeps the next window", () => {
+    const { store, windows, closed } = setup();
+    store.open('https://petdex.dev/');
+    const late = windows[0].handlers.closed;
+    windows[0].destroyed = true;
+    store.open('https://petdex.dev/pets/lando');
+    expect(windows.length).toBe(2);
+    late();
+    expect(closed).toEqual([true]);
+    expect(store.window()).toBe(windows[1]);
+    windows[1].destroy();
+    expect(closed).toEqual([true, true]);
+    expect(store.window()).toBeNull();
   });
 
   test('non-store links go to the default browser', () => {

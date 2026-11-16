@@ -1,7 +1,16 @@
 import { describe, test, expect } from 'bun:test';
 import {
+  ACTION_GAP_PX,
+  ACTION_ROW_PX,
+  actionRows,
+  actionWidth,
   BUBBLE_HEIGHT,
+  BUBBLE_MAX_WIDTH,
   BUBBLE_MIN_WIDTH,
+  bubbleArea,
+  LINE_ROW_PX,
+  PANEL_MIN_WIDTH,
+  panelArea,
   SCREEN_MARGIN,
   clampRect,
   clampSprite,
@@ -96,6 +105,7 @@ describe('geometry', () => {
         spriteWidth: 144,
         spriteHeight: 156,
         bubble: null,
+        panel: null,
         second: null
       }
     });
@@ -501,6 +511,19 @@ describe('createPetWindowManager', () => {
     expect(settings().positions.last).toEqual({ x: offset, y: 400 });
   });
 
+  test("a late 'closed' from the old window keeps the new one", () => {
+    const { manager, windows } = setup();
+    manager.show({ size: 'm' });
+    const closed = windows[0].fire.bind(null, 'closed');
+    windows[0].destroy = () => {
+      windows[0].destroyed = true;
+    };
+    manager.hide();
+    manager.show({ size: 'm' });
+    closed();
+    expect(manager.window()).toBe(windows[1]);
+  });
+
   test('hide destroys the window', () => {
     const { manager, windows } = setup();
     manager.show({ size: 'm' });
@@ -508,5 +531,225 @@ describe('createPetWindowManager', () => {
     expect(windows[0].destroyed).toBe(true);
     expect(manager.isShown()).toBe(false);
     expect(manager.window()).toBeNull();
+  });
+});
+
+// --- Round 3 (L4): bubble buttons, click panel, badge ---
+
+const ACTIONS_LIVE = [
+  { id: 'ok', label: 'OK' },
+  { id: 'quiet-session', label: 'Quiet this session' },
+  { id: 'mute', label: 'No result reactions' }
+];
+const PANEL = {
+  lines: [
+    'Qualifying in 2 h 14 min · Las Vegas GP',
+    'Max Verstappen won the São Paulo GP'
+  ],
+  actions: [
+    { id: 'ask', label: 'Ask F1' },
+    { id: 'rate', label: 'Rate São Paulo GP' },
+    { id: 'stats', label: 'On this day' },
+    { id: 'hot-lap', label: 'Hot lap' },
+    { id: 'pets', label: 'Pets' }
+  ]
+};
+
+describe('round-3 layout estimates', () => {
+  test('button widths and greedy rows (flex-wrap)', () => {
+    expect(actionWidth('OK')).toBe(2 * 8 + 16);
+    expect(actionRows([], 300)).toBe(0);
+    expect(actionRows([{ label: 'OK' }], 300)).toBe(1);
+    // 3 × 112 px + 2 gaps = 348 > 300 → two rows.
+    const wide = Array.from({ length: 3 }, () => ({ label: 'x'.repeat(12) }));
+    expect(actionRows(wide, 300)).toBe(2);
+    expect(actionRows(wide, 348)).toBe(1);
+  });
+
+  test("without buttons the bubble area is today's 240 × 64", () => {
+    expect(bubbleArea(null, 144)).toEqual({
+      width: BUBBLE_MIN_WIDTH,
+      height: BUBBLE_HEIGHT
+    });
+    expect(bubbleArea([], 400)).toEqual({ width: 400, height: BUBBLE_HEIGHT });
+  });
+
+  test('a button row makes the bubble taller and as wide as its one row', () => {
+    const area = bubbleArea(ACTIONS_LIVE, 144);
+    expect(area.height).toBe(BUBBLE_HEIGHT + ACTION_GAP_PX + ACTION_ROW_PX);
+    const row =
+      ACTIONS_LIVE.reduce((sum, a) => sum + actionWidth(a.label), 0) +
+      2 * ACTION_GAP_PX;
+    expect(area.width).toBe(row + 34);
+    expect(area.width).toBeLessThanOrEqual(BUBBLE_MAX_WIDTH);
+    expect(actionRows(ACTIONS_LIVE, area.width - 34)).toBe(1);
+    // Short labels keep the minimum width.
+    expect(bubbleArea([{ id: 'ok', label: 'OK' }], 144).width).toBe(
+      BUBBLE_MIN_WIDTH
+    );
+  });
+
+  test('a row wider than BUBBLE_MAX_WIDTH wraps and reserves the rows', () => {
+    const many = Array.from({ length: 6 }, () => ({ label: 'x'.repeat(10) }));
+    const area = bubbleArea(many, 144);
+    expect(area.width).toBe(BUBBLE_MAX_WIDTH);
+    const rows = actionRows(many, BUBBLE_MAX_WIDTH - 34);
+    expect(rows).toBe(2);
+    expect(area.height).toBe(
+      BUBBLE_HEIGHT + ACTION_GAP_PX + 2 * ACTION_ROW_PX + ACTION_GAP_PX
+    );
+  });
+
+  test('panel area: lines (≤ 2 rows each) + wrapped buttons', () => {
+    const area = panelArea(PANEL, 144);
+    expect(area.width).toBe(PANEL_MIN_WIDTH);
+    const inner = PANEL_MIN_WIDTH - 34;
+    const rows = actionRows(PANEL.actions, inner);
+    expect(rows).toBe(2);
+    // 266 px rows at 7.5 px a character: the 39-character countdown is
+    // reserved two rows (a little spare room in most fonts), the winner one.
+    expect(area.height).toBe(
+      30 + 3 * LINE_ROW_PX + 8 + 2 * ACTION_ROW_PX + ACTION_GAP_PX
+    );
+    // A 60-character line takes two rows, never more.
+    const long = panelArea({ lines: ['x'.repeat(60)], actions: [] }, 144);
+    expect(long.height).toBe(30 + 2 * LINE_ROW_PX);
+    const huge = panelArea({ lines: ['x'.repeat(500)], actions: [] }, 144);
+    expect(huge.height).toBe(long.height);
+    // A duo at size l is wider than the minimum: the panel follows it.
+    expect(panelArea(PANEL, 394).width).toBe(394);
+    expect(panelArea({ lines: [], actions: [] }, 144).height).toBe(30);
+  });
+
+  test('windowLayout: the panel takes the bubble’s place above the pet, sprite fixed', () => {
+    const sprite = { x: 800, y: 600, ...M };
+    const { bounds, box } = windowLayout({
+      sprite,
+      bubble: false,
+      panel: PANEL,
+      workArea: primary.workArea
+    });
+    const area = panelArea(PANEL, M.width);
+    expect(box).toMatchObject({ panel: 'above', bubble: null });
+    expect(bounds.height).toBe(M.height + area.height);
+    expect(bounds.width).toBe(area.width);
+    expect(bounds.y).toBe(600 - area.height);
+    expect(bounds.x + box.spriteLeft).toBe(800);
+    expect(bounds.y + box.spriteTop).toBe(600);
+  });
+
+  test('windowLayout: no room above → the panel goes below; it wins over a bubble', () => {
+    const sprite = { x: 800, y: 20, ...M };
+    const { bounds, box } = windowLayout({
+      sprite,
+      bubble: true,
+      bubbleActions: ACTIONS_LIVE,
+      panel: PANEL,
+      workArea: primary.workArea
+    });
+    expect(box).toMatchObject({ panel: 'below', bubble: null, spriteTop: 0 });
+    expect(bounds.y).toBe(20);
+    expect(bounds.height).toBe(M.height + panelArea(PANEL, M.width).height);
+  });
+
+  test('windowLayout: a bubble with buttons is taller and wider', () => {
+    const sprite = { x: 800, y: 600, ...M };
+    const plain = windowLayout({
+      sprite,
+      bubble: true,
+      workArea: primary.workArea
+    });
+    const withButtons = windowLayout({
+      sprite,
+      bubble: true,
+      bubbleActions: ACTIONS_LIVE,
+      workArea: primary.workArea
+    });
+    expect(withButtons.box).toMatchObject({ bubble: 'above', panel: null });
+    expect(withButtons.bounds.height - plain.bounds.height).toBe(
+      ACTION_GAP_PX + ACTION_ROW_PX
+    );
+    expect(withButtons.bounds.width).toBe(bubbleArea(ACTIONS_LIVE, 144).width);
+    expect(withButtons.bounds.y + withButtons.box.spriteTop).toBe(600);
+    // bubbleActions without a bubble change nothing.
+    expect(
+      windowLayout({
+        sprite,
+        bubble: false,
+        bubbleActions: ACTIONS_LIVE,
+        workArea: primary.workArea
+      }).bounds
+    ).toEqual({ x: 800, y: 600, ...M });
+  });
+});
+
+describe('createPetWindowManager (round 3)', () => {
+  function shown() {
+    const ctx = setup();
+    ctx.manager.show({ size: 'm' });
+    ctx.windows[0].webContents.fire('did-finish-load');
+    return ctx;
+  }
+
+  test('bubble buttons grow the window; the payload reaches the page with the box', () => {
+    const { manager, windows } = shown();
+    const before = { ...windows[0].bounds };
+    manager.render(
+      payload({ bubble: 'P3 for Lando', bubbleActions: ACTIONS_LIVE })
+    );
+    expect(windows[0].bounds.height).toBe(
+      before.height + BUBBLE_HEIGHT + ACTION_GAP_PX + ACTION_ROW_PX
+    );
+    const [channel, sent] = windows[0].sent.at(-1);
+    expect(channel).toBe('pet:render');
+    expect(sent.bubbleActions).toEqual(ACTIONS_LIVE);
+    expect(sent.box).toMatchObject({ bubble: 'above', panel: null });
+    manager.render(payload());
+    expect(windows[0].bounds).toEqual(before);
+  });
+
+  test('the panel opens above the pet and closes back; the sprite never moves', () => {
+    const { manager, windows } = shown();
+    const sprite = manager.spriteRect();
+    const before = { ...windows[0].bounds };
+    manager.render(payload({ panel: PANEL }));
+    const sent = windows[0].sent.at(-1)[1];
+    expect(sent.box.panel).toBe('above');
+    expect(windows[0].bounds.height).toBe(
+      before.height + panelArea(PANEL, M.width).height
+    );
+    expect(windows[0].bounds.y + sent.box.spriteTop).toBe(sprite.y);
+    expect(windows[0].bounds.x + sent.box.spriteLeft).toBe(sprite.x);
+    manager.render(payload({ panel: null }));
+    expect(windows[0].bounds).toEqual(before);
+    expect(manager.spriteRect()).toEqual(sprite);
+  });
+
+  test('dragging with the panel open re-sends the layout', () => {
+    const { manager, windows } = shown();
+    manager.render(payload({ panel: PANEL }));
+    const count = windows[0].sent.length;
+    manager.moveBy(-30, -40);
+    expect(windows[0].sent.length).toBe(count + 1);
+    expect(windows[0].sent.at(-1)[1].box.panel).toBe('above');
+  });
+
+  test('a badge needs no extra space', () => {
+    const { manager, windows } = shown();
+    const before = { ...windows[0].bounds };
+    manager.render(
+      payload({ badge: { kind: 'answer', label: 'Answer ready' } })
+    );
+    expect(windows[0].bounds).toEqual(before);
+    expect(windows[0].sent.at(-1)[1].badge).toEqual({
+      kind: 'answer',
+      label: 'Answer ready'
+    });
+  });
+
+  test('the Electron pet window draws every round-3 feature', () => {
+    const { manager } = setup();
+    expect(manager.can('panel')).toBe(true);
+    expect(manager.can('badge')).toBe(true);
   });
 });

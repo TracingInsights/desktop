@@ -4,8 +4,9 @@
  *
  * The native pet accepts timeline sprites only inside userData (ti-pet's
  * `timeline.zig` `pathInside`). Pets from our own store already live there;
- * a pet from the Codex folder (`~/.codex/pets`, read-only to us) does not, so
- * its sheet is copied into `userData/pet-sprites/` (0600) and the timeline
+ * a pet from the Codex or Petdex CLI folder (`~/.codex/pets`,
+ * `~/.petdex/pets`, read-only to us) does not, so its sheet is copied into
+ * `userData/pet-sprites/` (0600, one copy per source path) and the timeline
  * points at the copy. The copy is refreshed whenever the source's size or
  * mtime changes. Live `render` messages keep the original path.
  */

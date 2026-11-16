@@ -4,12 +4,15 @@ import {
   encodeLine,
   MAX_LINE_BYTES,
   menuFromTemplate,
+  NATIVE_CAPS,
+  nativeAnim,
   nativeBinaryName,
   nativeSocketPath,
   parsePetsOpenArg,
   toNativeRender,
   validateFromNative
 } from './native-protocol.mjs';
+import { PANEL_ACTION_IDS } from './contract.mjs';
 import { buildPetMenuTemplate, buildTrayMenuTemplate } from './tray.mjs';
 
 describe('framing', () => {
@@ -235,5 +238,241 @@ describe('paths and args', () => {
       expect(parsePetsOpenArg([bad])).toBeNull();
     }
     expect(parsePetsOpenArg(['--hidden'])).toBeNull();
+  });
+});
+
+describe('round 3: caps-gated native renders (L6)', () => {
+  /** ti-pet-v0.1.1's `ready.caps`. */
+  const V1_CAPS = ['duo', 'bubble', 'menu', 'timeline'];
+  const ALL_CAPS = [...V1_CAPS, ...Object.values(NATIVE_CAPS)];
+  const paths = (u) =>
+    u.startsWith('pet-asset://') ? `/p/${u.at(-1)}.webp` : null;
+  const ROUND3 = {
+    state: 'look-a',
+    row: 9,
+    frames: 8,
+    durationMs: 1120,
+    once: true,
+    still: false,
+    playKey: 'look:1',
+    bubble: 'On this day · 2026-11-07',
+    size: 'm',
+    atlas: { url: 'pet-asset://pet/a', rows: 11, scale: 1 },
+    second: { url: 'pet-asset://pet/b', rows: 9, scale: 1 },
+    motion: 'roam',
+    sleeping: true,
+    bubbleActions: [
+      { id: 'ok', label: 'OK' },
+      { id: 'quiet-1h', label: 'Quiet 1 h' },
+      { id: 'mute', label: 'No daily facts' }
+    ],
+    panel: {
+      lines: ['Race in 2 h · Abu Dhabi GP', 'Norris P1'],
+      actions: [{ id: 'ask', label: 'Ask F1' }]
+    },
+    badge: { kind: 'answer', label: 'Answer ready' },
+    secondAnim: {
+      state: 'look-b',
+      row: 10,
+      frames: 8,
+      durationMs: 1120,
+      once: true,
+      still: false,
+      playKey: 'look:1:second',
+      delayMs: 700
+    }
+  };
+  const V1_KEYS = [
+    'state',
+    'row',
+    'frames',
+    'durationMs',
+    'once',
+    'still',
+    'playKey',
+    'bubble',
+    'size',
+    'atlas',
+    'second'
+  ];
+
+  test('a ti-pet-v0.1.1 pet (or no caps): today’s shape, a look sent as idle', () => {
+    for (const caps of [V1_CAPS, null, undefined, ['duo', 7]]) {
+      const out = toNativeRender(ROUND3, paths, caps);
+      expect(Object.keys(out).sort()).toEqual([...V1_KEYS].sort());
+      expect(out).toMatchObject({
+        state: 'idle',
+        row: 0,
+        frames: 6,
+        durationMs: 1100,
+        once: false,
+        still: false,
+        playKey: 'idle',
+        bubble: ROUND3.bubble,
+        atlas: { path: '/p/a.webp', rows: 11, scale: 1 }
+      });
+    }
+  });
+
+  test('a round-3 pet gets every field, the look rows kept', () => {
+    expect(toNativeRender(ROUND3, paths, ALL_CAPS)).toEqual({
+      state: 'look-a',
+      row: 9,
+      frames: 8,
+      durationMs: 1120,
+      once: true,
+      still: false,
+      playKey: 'look:1',
+      bubble: ROUND3.bubble,
+      size: 'm',
+      atlas: { path: '/p/a.webp', rows: 11, scale: 1 },
+      second: { path: '/p/b.webp', rows: 9, scale: 1 },
+      motion: 'roam',
+      sleeping: true,
+      bubbleActions: ROUND3.bubbleActions,
+      panel: ROUND3.panel,
+      badge: { kind: 'answer', label: 'Answer ready' },
+      secondAnim: ROUND3.secondAnim
+    });
+  });
+
+  test('each field rides only on its own cap; v2 rows only with v2-rows', () => {
+    const only = (cap) => toNativeRender(ROUND3, paths, [...V1_CAPS, cap]);
+    expect(only('motion')).toMatchObject({ motion: 'roam', state: 'idle' });
+    expect(only('motion')).not.toHaveProperty('sleeping');
+    expect(only('sleep').sleeping).toBe(true);
+    expect(only('bubble-actions').bubbleActions).toHaveLength(3);
+    expect(only('panel').panel.lines).toHaveLength(2);
+    expect(only('badge').badge.label).toBe('Answer ready');
+    // The partner's own look needs v2-rows too: idle without it.
+    expect(only('second-anim').secondAnim).toMatchObject({
+      state: 'idle',
+      row: 0,
+      frames: 6,
+      delayMs: 700
+    });
+    expect(only('v2-rows')).toMatchObject({ state: 'look-a', row: 9 });
+    for (const cap of Object.values(NATIVE_CAPS)) {
+      if (cap === 'timeline-v2' || cap === 'v2-rows') continue;
+      expect(Object.keys(only(cap))).toHaveLength(V1_KEYS.length + 1);
+    }
+  });
+
+  test('nothing new is sent as the “nothing new” value; junk is dropped', () => {
+    const plain = {
+      ...ROUND3,
+      state: 'idle',
+      row: 0,
+      frames: 6,
+      durationMs: 1100,
+      bubble: null,
+      motion: 'fly',
+      sleeping: undefined,
+      bubbleActions: [{ id: 'ok', label: 'OK' }],
+      panel: 'open',
+      badge: { kind: 'mail', label: 'x' },
+      secondAnim: { state: 'dance' },
+      second: null
+    };
+    expect(toNativeRender(plain, paths, ALL_CAPS)).toMatchObject({
+      motion: null,
+      sleeping: false,
+      // Buttons only with a bubble.
+      bubbleActions: null,
+      panel: null,
+      badge: null,
+      secondAnim: null
+    });
+    const many = toNativeRender(
+      {
+        ...ROUND3,
+        bubbleActions: [...ROUND3.bubbleActions, { id: 'x', label: 'X' }, 7],
+        panel: { lines: ['a', '', 1, 'b', 'c', 'd'], actions: 'none' }
+      },
+      paths,
+      ALL_CAPS
+    );
+    expect(many.bubbleActions.map((a) => a.id)).toEqual([
+      'ok',
+      'quiet-1h',
+      'mute'
+    ]);
+    expect(many.panel).toEqual({ lines: ['a', 'b', 'c'], actions: [] });
+  });
+
+  test('nativeAnim: only v2 states change, and only without v2-rows', () => {
+    const wave = {
+      state: 'waving',
+      row: 3,
+      frames: 4,
+      durationMs: 700,
+      once: true
+    };
+    expect(nativeAnim(wave, false)).toBe(wave);
+    const look = {
+      state: 'look-b',
+      row: 10,
+      frames: 8,
+      durationMs: 1120,
+      once: true,
+      still: true,
+      playKey: 'k'
+    };
+    expect(nativeAnim(look, true)).toBe(look);
+    expect(nativeAnim(look, false)).toEqual({
+      state: 'idle',
+      row: 0,
+      frames: 6,
+      durationMs: 1100,
+      once: false,
+      still: true,
+      playKey: 'idle'
+    });
+  });
+});
+
+describe('round 3: events from the native pet (L6)', () => {
+  test('bubbleAction / panelAction carry a known id; anything else drops the line', () => {
+    expect(
+      validateFromNative({ kind: 'event', event: 'bubbleAction', id: 'mute' })
+    ).toEqual({ kind: 'event', event: 'bubbleAction', id: 'mute' });
+    expect(
+      validateFromNative({ kind: 'event', event: 'panelAction', id: 'close' })
+    ).toEqual({ kind: 'event', event: 'panelAction', id: 'close' });
+    for (const id of PANEL_ACTION_IDS) {
+      expect(
+        validateFromNative({ kind: 'event', event: 'panelAction', id })?.id
+      ).toBe(id);
+    }
+    for (const bad of [
+      { event: 'bubbleAction' },
+      { event: 'bubbleAction', id: 'ask' },
+      { event: 'bubbleAction', id: 'close' },
+      { event: 'panelAction', id: 'mute' },
+      { event: 'panelAction', id: 7 },
+      { event: 'panelClose' }
+    ]) {
+      expect(validateFromNative({ kind: 'event', ...bad })).toBeNull();
+    }
+    // An id on a plain event is not kept.
+    expect(
+      validateFromNative({ kind: 'event', event: 'click', id: 'ok' })
+    ).toEqual({ kind: 'event', event: 'click' });
+  });
+
+  test('position keeps walk: true (a walk ended there), nothing else', () => {
+    expect(
+      validateFromNative({ kind: 'position', x: 5, y: 6, walk: true })
+    ).toEqual({
+      kind: 'position',
+      x: 5,
+      y: 6,
+      displayId: null,
+      secondSide: 'left',
+      walk: true
+    });
+    expect(
+      validateFromNative({ kind: 'position', x: 5, y: 6, walk: 'yes' })
+    ).not.toHaveProperty('walk');
   });
 });

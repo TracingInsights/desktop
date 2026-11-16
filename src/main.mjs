@@ -1,7 +1,7 @@
 /**
  * TracingInsights Desktop — Electron shell + inference harness.
  *
- * The main window loads the production web app (https://app.tracinginsights.com).
+ * The main window loads the production web app (https://tracinginsights.com).
  * The Electron main process is the inference harness: it owns custom-provider
  * credentials (safeStorage), the Codex/xAI device-auth + credential stores,
  * the protocol adapters (anthropic-messages / openai-completions /
@@ -48,6 +48,7 @@ import { existsSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { appOriginsFor, isAppOrigin } from './app-origin.mjs';
 import { createProviderRegistry } from './provider-registry.mjs';
 import { createCredentialStore } from './credential-store.mjs';
 import { createCodexAuth } from './codex-auth.mjs';
@@ -55,7 +56,11 @@ import { createXaiAuth } from './xai-auth.mjs';
 import { createCodexInference } from './codex-inference.mjs';
 import { createXaiInference } from './xai-inference.mjs';
 import { createInference } from './inference.mjs';
-import { createHarnessIpc, isTrustedAppSender } from './ipc.mjs';
+import {
+  abortOnNavigation,
+  createHarnessIpc,
+  isTrustedAppSender
+} from './ipc.mjs';
 import { listModels } from './model-discovery.mjs';
 import {
   MODEL_LOAD_GRACE_MS,
@@ -73,7 +78,7 @@ import {
   parsePetsOpenArg,
   REFRESH_ARG
 } from './pets/native-protocol.mjs';
-import { ASK_PATH } from './pets/contract.mjs';
+import { isAskPath } from './pets/ask-window.mjs';
 import { createNotifier } from './pets/notify.mjs';
 import { attachZoomKeys } from './zoom-keys.mjs';
 import updaterPkg from 'electron-updater';
@@ -94,9 +99,23 @@ const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Override in dev with TIF1AI_APP_URL=http://localhost:5173 or
-// TIF1AI_APP_URL=http://127.0.0.1:5173.
-const APP_URL = process.env.TIF1AI_APP_URL || 'https://app.tracinginsights.com';
-const APP_ORIGIN = new URL(APP_URL).origin;
+// TIF1AI_APP_URL=http://127.0.0.1:5173. Builds before the host switch
+// (0.2.2 and older) load app.tracinginsights.com, which Cloudflare leaves
+// unredirected for Electron (docs/HOST_SWITCH_PLAN.md step 10).
+const APP_URL = process.env.TIF1AI_APP_URL || 'https://tracinginsights.com';
+/** Origins that are the app (both production hosts around the host switch). */
+const APP_ORIGINS = appOriginsFor(APP_URL);
+
+// On-device model (WebGPU): Chromium on Linux runs WebGPU on Vulkan and ships
+// with both off, so the model reports "Not supported". A Chrome user sets them
+// in chrome://flags (the site's help: linux-vulkan, linux-webgpu-flag); the app
+// has no flags page, so it sets them itself. Switches must be set before
+// `ready`. TIF1AI_NO_WEBGPU_FLAGS=1 leaves them off (e.g. if Vulkan breaks
+// video playback with some driver, as it can in Chrome).
+if (process.platform === 'linux' && !process.env.TIF1AI_NO_WEBGPU_FLAGS) {
+  app.commandLine.appendSwitch('enable-unsafe-webgpu');
+  app.commandLine.appendSwitch('enable-features', 'Vulkan');
+}
 
 let mainWindow = null;
 /** Desktop pets runtime (built after `ready`). */
@@ -165,7 +184,7 @@ function buildHarness() {
       isTrustedAppSender(event, {
         mainWindow,
         windows: [pets?.askWindow() ?? null],
-        appOrigin: APP_ORIGIN
+        appOrigin: APP_ORIGINS
       }),
     registry,
     codex: codexAuth,
@@ -184,10 +203,7 @@ function buildHarness() {
  * that window's requests (the quick-ask window streams alongside).
  */
 function abortInferenceWith(webContents) {
-  const abort = () => harness?.ipc.abortSender(webContents);
-  webContents.on('did-navigate', abort);
-  webContents.on('did-navigate-in-page', abort);
-  webContents.on('destroyed', abort);
+  abortOnNavigation(webContents, () => harness?.ipc.abortSender(webContents));
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +219,7 @@ const WINDOW_WEB_PREFERENCES = {
 
 function sameAppOrigin(url) {
   try {
-    return new URL(url).origin === APP_ORIGIN;
+    return isAppOrigin(new URL(url).origin, APP_ORIGINS);
   } catch {
     return false;
   }
@@ -239,10 +255,22 @@ const OAUTH_PROVIDER_ORIGINS = new Set([
   'https://github.com',
   'https://accounts.google.com'
 ]);
+// OpenRouter's PKCE sign-in (src/lib/ai/openrouter/oauth.ts) is not a social
+// provider but must also stay in the window: the verifier lives in this
+// window's sessionStorage, so a callback in the system browser cannot finish.
+// /auth redirects to /sign-up, whose Clerk frontend API is clerk.openrouter.ai.
+const OPENROUTER_SIGN_IN_ORIGINS = new Set([
+  'https://openrouter.ai',
+  'https://clerk.openrouter.ai'
+]);
 
 function isOAuthProviderOrigin(url) {
   try {
-    return OAUTH_PROVIDER_ORIGINS.has(new URL(url).origin);
+    const { origin } = new URL(url);
+    return (
+      OAUTH_PROVIDER_ORIGINS.has(origin) ||
+      OPENROUTER_SIGN_IN_ORIGINS.has(origin)
+    );
   } catch {
     return false;
   }
@@ -250,6 +278,8 @@ function isOAuthProviderOrigin(url) {
 
 /** @param {string} [path] app path to open instead of `/` (e.g. '/settings/pets') */
 function createWindow(path) {
+  // Opened during a hidden install start: a cancel no longer shows one.
+  hiddenForInstall = false;
   const devIconPath = join(__dirname, '..', 'build', 'icon.png');
   const windowIcon =
     process.platform !== 'darwin' && existsSync(devIconPath)
@@ -271,7 +301,7 @@ function createWindow(path) {
   // Only app-origin paths: the main window is the trusted IPC sender.
   const target = path ? new URL(path, APP_URL) : null;
   mainWindow.loadURL(
-    target && target.origin === APP_ORIGIN ? target.href : APP_URL
+    target && isAppOrigin(target.origin, APP_ORIGINS) ? target.href : APP_URL
   );
 
   attachZoomKeys(mainWindow.webContents);
@@ -308,8 +338,10 @@ function createWindow(path) {
  * @param {string} [path]
  */
 function focusMainWindow(path) {
-  if (pets && path === ASK_PATH) {
-    // The native pet's "Ask an F1 question…" while the app was closed.
+  if (pets && isAskPath(path)) {
+    // The native pet's "Ask an F1 question…" / panel "Ask F1" while the app
+    // was closed (`--pets-open=/desktop/ask`): the Ask window, not a main
+    // window on that path.
     void pets.openAsk();
     return;
   }
@@ -336,7 +368,37 @@ let lastCheckWasManual = false;
 let updateReadyVersion = null;
 /** Started by the native pet's "Restart to update": install once downloaded. */
 let installWhenDownloaded = process.argv.includes(INSTALL_UPDATE_ARG);
+/** This start kept the main window closed only for that install. */
+let hiddenForInstall = false;
+/** `window-all-closed` came while the install was armed. */
+let allClosedHeld = false;
 let updaterSetUp = false;
+
+/**
+ * "Restart to update" found nothing to install (no update, or the check or
+ * download failed): disarm it, so a later background download never
+ * restarts the app silently, and show a start that stayed hidden for it.
+ * A window closed while it was armed closes now, as it would have then
+ * (tray, hand-off to the native pet, or quit).
+ */
+function cancelInstallWhenDownloaded() {
+  if (!installWhenDownloaded) return;
+  installWhenDownloaded = false;
+  if (hiddenForInstall) {
+    hiddenForInstall = false;
+    focusMainWindow();
+  }
+  pets?.installCancelled();
+  if (allClosedHeld) {
+    allClosedHeld = false;
+    if (
+      BrowserWindow.getAllWindows().length === 0 &&
+      !pets?.lifecycle.isQuitting()
+    ) {
+      onAllWindowsClosed();
+    }
+  }
+}
 
 /** Restart into the downloaded update — a running native pet exits first. */
 function installUpdate() {
@@ -362,6 +424,7 @@ function setupAutoUpdater() {
   autoUpdater.on('error', (error) => {
     console.error('[updater] check failed:', error);
     checkingForUpdates = false;
+    cancelInstallWhenDownloaded();
     if (lastCheckWasManual) {
       dialog.showErrorBox(
         'Update check failed',
@@ -390,6 +453,7 @@ function setupAutoUpdater() {
   autoUpdater.on('update-not-available', (info) => {
     console.log('[updater] no update available (current:', info?.version, ')');
     checkingForUpdates = false;
+    cancelInstallWhenDownloaded();
     if (lastCheckWasManual) {
       dialog
         .showMessageBox(mainWindow ?? undefined, {
@@ -441,6 +505,7 @@ function checkForUpdates(manual = false) {
   autoUpdater.checkForUpdates().catch((error) => {
     checkingForUpdates = false;
     console.error('[updater] check failed:', error);
+    cancelInstallWhenDownloaded();
     if (manual) {
       dialog.showErrorBox(
         'Update check failed',
@@ -564,6 +629,9 @@ if (!gotLock) {
   // Relaunching with --ozone-platform=x11 (pets on in a Wayland session).
 } else {
   app.on('second-instance', (_event, argv) => {
+    // Another refresh run (the pet's timer) needs nothing from this one —
+    // neither a promotion nor a window.
+    if (Array.isArray(argv) && argv.includes(REFRESH_ARG)) return;
     promoteRefreshRun();
     if (Array.isArray(argv) && argv.includes(INSTALL_UPDATE_ARG)) {
       if (updateReadyVersion) installUpdate();
@@ -581,6 +649,12 @@ if (!gotLock) {
   app.whenReady().then(async () => {
     harness = buildHarness();
     pets = buildPets();
+    // Registered before a refresh run's early return: a promoted run is a
+    // normal app from then on.
+    app.on('activate', () => {
+      if (refreshRun) return;
+      if (!mainWindow || mainWindow.isDestroyed()) focusMainWindow();
+    });
     if (refreshRun && pets) {
       // No window, menu or updater: recompile, hand over, exit.
       void pets.refreshAndExit({ exit: () => app.exit(0) });
@@ -591,36 +665,42 @@ if (!gotLock) {
     // Started at login (`--hidden`): tray + pet only, no main window.
     // Otherwise the first start with no pet opens the welcome step once.
     // `--pets-install-update`: no window either, the update installs.
-    const hidden =
-      (pets?.lifecycle.startedHidden() ?? false) || installWhenDownloaded;
+    const startedHidden = pets?.lifecycle.startedHidden() ?? false;
+    hiddenForInstall = installWhenDownloaded && !startedHidden;
+    const hidden = startedHidden || installWhenDownloaded;
     if (!hidden) {
       if (startOpenPath) focusMainWindow(startOpenPath);
       else if (pets) pets.lifecycle.startMain();
       else createWindow();
     }
     try {
-      pets?.start({ hidden, handOff: !installWhenDownloaded });
+      pets?.start({ hidden });
     } catch (error) {
       console.error('[pets] could not start:', error);
     }
     setupAutoUpdater();
-
-    app.on('activate', () => {
-      if (!mainWindow || mainWindow.isDestroyed()) focusMainWindow();
-    });
   });
 
   app.on('before-quit', (event) => pets?.beforeQuit(event));
 
-  app.on('window-all-closed', () => {
-    // Close to tray (default) keeps the app running with the tray (+ pet);
-    // with it off: macOS stays in the dock, other platforms quit and take
-    // the harness down with them.
-    const quit = pets
-      ? pets.shouldQuitOnAllClosed()
-      : process.platform !== 'darwin';
-    if (quit) app.quit();
-  });
+  app.on('window-all-closed', onAllWindowsClosed);
+}
+
+/** `window-all-closed`. */
+function onAllWindowsClosed() {
+  // An armed update install keeps the app until the download lands (or the
+  // install is cancelled, which replays this).
+  if (installWhenDownloaded) {
+    allClosedHeld = true;
+    return;
+  }
+  // Close to tray (default) keeps the app running with the tray (+ pet);
+  // with it off: macOS stays in the dock, other platforms quit and take
+  // the harness down with them.
+  const quit = pets
+    ? pets.shouldQuitOnAllClosed()
+    : process.platform !== 'darwin';
+  if (quit) app.quit();
 }
 
 /** The pets runtime, or null if it failed (the app itself must still open). */
@@ -642,7 +722,7 @@ function buildPets() {
         systemPreferences
       },
       appUrl: APP_URL,
-      appOrigin: APP_ORIGIN,
+      appOrigin: APP_ORIGINS,
       getMainWindow: () => mainWindow,
       createMainWindow: (path) => createWindow(path),
       userDataDir: app.getPath('userData'),
@@ -678,7 +758,9 @@ function buildPets() {
       // not install now (Windows cannot replace the running pet).
       beforeHandoffQuit: () => {
         autoUpdater.autoInstallOnAppQuit = false;
-      }
+      },
+      // A window closing meanwhile must not hand off or quit (drops it).
+      installArmed: () => installWhenDownloaded
     });
   } catch (error) {
     console.error('[pets] disabled:', error);

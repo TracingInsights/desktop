@@ -6,11 +6,12 @@ import {
   askNavigation,
   askWindowBounds,
   createAskWindow,
+  isAskPath,
   isCloseKey
 } from './ask-window.mjs';
 import { ASK_PATH } from './contract.mjs';
 
-const APP_URL = 'https://app.tracinginsights.com';
+const APP_URL = 'https://tracinginsights.com';
 const area = { x: 0, y: 0, width: 1920, height: 1040 };
 const right = { x: 1920, y: 0, width: 2560, height: 1400 };
 
@@ -83,7 +84,7 @@ describe('isCloseKey / askNavigation', () => {
     });
     // Lookalike origin is outside, not the app.
     expect(
-      askNavigation('https://app.tracinginsights.com.evil.com/chat', o).kind
+      askNavigation('https://tracinginsights.com.evil.com/chat', o).kind
     ).toBe('outside');
     expect(askNavigation('not a url', o).kind).toBe('outside');
   });
@@ -309,5 +310,88 @@ describe('createAskWindow', () => {
     ask.destroy();
     expect(windows[0].destroyed).toBe(true);
     expect(ask.window()).toBeNull();
+  });
+});
+
+// --- Round 3 (3b): background detection, attention, --pets-open ---
+
+describe('answer-ready support (round 3)', () => {
+  function askWith(log) {
+    const { BrowserWindow, windows } = fakeElectron();
+    const ask = createAskWindow({
+      BrowserWindow,
+      screen: {
+        getPrimaryDisplay: () => ({ workArea: area }),
+        getDisplayMatching: () => ({ workArea: area })
+      },
+      appUrl: APP_URL,
+      appOrigin: new URL(APP_URL).origin,
+      preloadPath: '/app/src/preload.cjs',
+      getPetRect: () => null,
+      openMain: () => {},
+      openOutside: () => {},
+      platform: 'linux',
+      onAttention: () => log.push('attention'),
+      onClosed: () => log.push('closed')
+    });
+    return { ask, windows };
+  }
+
+  /** @param {any} win @param {{ visible?: boolean, minimized?: boolean, focused?: boolean }} state */
+  const look = (win, { visible = true, minimized = false, focused = true }) => {
+    win.isVisible = () => visible;
+    win.isMinimized = () => minimized;
+    win.isFocused = () => focused;
+  };
+
+  test('inBackground: hidden, minimised or unfocused; never when closed', () => {
+    const { ask, windows } = askWith([]);
+    expect(ask.inBackground()).toBe(false);
+    ask.open();
+    const [win] = windows;
+    look(win, {});
+    expect(ask.inBackground()).toBe(false);
+    look(win, { focused: false });
+    expect(ask.inBackground()).toBe(true);
+    look(win, { minimized: true });
+    expect(ask.inBackground()).toBe(true);
+    look(win, { visible: false });
+    expect(ask.inBackground()).toBe(true);
+    win.close();
+    expect(ask.inBackground()).toBe(false);
+  });
+
+  test('opening, bringing forward or focusing it calls onAttention', () => {
+    const log = [];
+    const { ask, windows } = askWith(log);
+    ask.open();
+    expect(log).toEqual(['attention']);
+    ask.open();
+    expect(log).toEqual(['attention', 'attention']);
+    expect(windows[0].calls).toContainEqual(['focus']);
+    windows[0].handlers.get('focus')();
+    expect(log).toEqual(['attention', 'attention', 'attention']);
+    windows[0].close();
+    expect(log.at(-1)).toBe('closed');
+  });
+
+  test('isAskPath: the ask page (query / hash allowed), nothing else', () => {
+    expect(isAskPath(ASK_PATH)).toBe(true);
+    expect(isAskPath(`${ASK_PATH}?from=pet`)).toBe(true);
+    expect(isAskPath(`${ASK_PATH}#x`)).toBe(true);
+    for (const path of [
+      '/desktop/ask/more',
+      '/desktop/asks',
+      '/',
+      '/chat',
+      'desktop/ask',
+      '//evil.example/desktop/ask',
+      `${APP_URL}${ASK_PATH}`,
+      undefined,
+      null,
+      42
+    ]) {
+      expect({ path, ask: isAskPath(path) }).toEqual({ path, ask: false });
+    }
   });
 });

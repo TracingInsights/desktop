@@ -70,8 +70,8 @@ function setup({ settingsOverrides = {}, applyLaunchAtLogin } = {}) {
     controller: {
       quiet: (kind) =>
         kind === 'session' ? { ok: false, error: 'No session' } : { ok: true },
-      signal: (s) => {
-        log.push(['signal', s]);
+      signal: (s, from) => {
+        log.push(from ? ['signal', s, from] : ['signal', s]);
         return { ok: true };
       },
       assetsChanged: () => log.push(['assetsChanged'])
@@ -109,11 +109,13 @@ describe('pets service', () => {
       positions: { a: 1 },
       lastResultKey: 'k',
       lastRateKey: 'k',
-      lastFactDay: '2026-11-06'
+      lastFactDay: '2026-11-06',
+      lastGreetingKey: '2026-11-06:morning'
     });
     expect(view).not.toHaveProperty('positions');
     expect(view).not.toHaveProperty('firstTrayNoticeShown');
     expect(view).not.toHaveProperty('lastResultKey');
+    expect(view).not.toHaveProperty('lastGreetingKey');
     expect(Object.keys(view).sort()).toEqual(
       [
         'v',
@@ -122,6 +124,7 @@ describe('pets service', () => {
         'size',
         'chatReactions',
         'sessionReactions',
+        'roam',
         'quietUntil',
         'closeToTray',
         'launchAtLogin',
@@ -132,6 +135,7 @@ describe('pets service', () => {
         'resultReactions',
         'dailyFact',
         'rateNudge',
+        'greetings',
         'secondPetId',
         'onboardingShown'
       ].sort()
@@ -232,6 +236,21 @@ describe('pets service', () => {
       'signal',
       'done'
     ]);
+  });
+
+  test('signals keep the window they came from, through the rate limit too', () => {
+    const { service, log, tick } = setup();
+    service.signal('planning', 'ask');
+    for (let i = 0; i < SIGNALS_PER_SECOND - 1; i += 1) {
+      service.signal('streaming', 'main');
+    }
+    // Over the limit: held, then applied with its sender.
+    service.signal('done', 'ask');
+    const signals = () => log.filter(([k]) => k === 'signal');
+    expect(signals()[0]).toEqual(['signal', 'planning', 'ask']);
+    expect(signals().length).toBe(SIGNALS_PER_SECOND);
+    tick(1000);
+    expect(signals().at(-1)).toEqual(['signal', 'done', 'ask']);
   });
 });
 
@@ -369,6 +388,26 @@ describe('companion methods (round 2)', () => {
       expect(
         (await thrown.service.setFavorite('max-verstappen')).followError
       ).toBe('boom');
+    });
+
+    test('a slow install never overrides a newer favourite', async () => {
+      let release;
+      const gate = new Promise((resolve) => (release = resolve));
+      const { service, settings } = companion({
+        install: async (slug) => {
+          await gate;
+          return { ok: true, pet: listed(`petdex:${slug}`) };
+        }
+      });
+      const first = service.setFavorite('max-verstappen');
+      await service.setFavorite('lando-norris');
+      expect(settings.get().activePetId).toBe('petdex:lando');
+      release();
+      await first;
+      expect(settings.get()).toMatchObject({
+        favoriteDriverId: 'lando-norris',
+        activePetId: 'petdex:lando'
+      });
     });
 
     test('followFavorite off: saved, no switch', async () => {
@@ -558,9 +597,12 @@ describe('companion methods (round 2)', () => {
     const { service, settings } = companion();
     settings.setMarker('lastResultKey', 'race-1');
     settings.setMarker('lastFactDay', '2026-11-06');
+    settings.setMarker('lastGreetingKey', '2026-11-06:evening');
     const { status } = await service.status();
     expect(status.settings).not.toHaveProperty('lastResultKey');
     expect(status.settings).not.toHaveProperty('lastRateKey');
     expect(status.settings).not.toHaveProperty('lastFactDay');
+    expect(status.settings).not.toHaveProperty('lastGreetingKey');
+    expect(status.settings.greetings).toBe(true);
   });
 });

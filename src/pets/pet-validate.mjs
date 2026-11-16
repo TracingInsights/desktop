@@ -1,6 +1,6 @@
 /**
  * Desktop pets — the one validator every pet passes before it is shown
- * (Petdex, Codex folder, import; docs/DESKTOP_PETS_PLAN.md §4.2).
+ * (Petdex, Codex / Petdex CLI folders, import; docs/DESKTOP_PETS_PLAN.md §4.2).
  *
  * The image is identified by its magic bytes, never its extension, and its
  * dimensions come from `decodeImage` (Electron injects a nativeImage-based
@@ -113,7 +113,9 @@ export function isBareSpritePath(value) {
 }
 
 /**
- * Parse and check a pet.json buffer.
+ * Parse and check a pet.json buffer. `spriteVersionNumber` is only what
+ * the file declares (1 | 2, anything else → null): the sheet's size decides
+ * the version (`validatePet`), as on Petdex.
  * @param {Uint8Array|null|undefined} buf
  * @returns {{ ok: true, petJson: { id: string|null, displayName: string, description: string|null, spritesheetPath: string, spriteVersionNumber: 1|2|null } } | { ok: false, error: string }}
  */
@@ -163,14 +165,6 @@ export function validatePetJson(buf) {
     };
   }
   const version = raw.spriteVersionNumber;
-  if (
-    version !== undefined &&
-    version !== null &&
-    version !== 1 &&
-    version !== 2
-  ) {
-    return { ok: false, error: 'pet.json spriteVersionNumber must be 1 or 2.' };
-  }
   return {
     ok: true,
     petJson: {
@@ -178,7 +172,7 @@ export function validatePetJson(buf) {
       displayName,
       description,
       spritesheetPath: raw.spritesheetPath,
-      spriteVersionNumber: version ?? null
+      spriteVersionNumber: version === 1 || version === 2 ? version : null
     }
   };
 }
@@ -213,20 +207,14 @@ export function validatePet({ petJsonBuf, imageBuf, decodeImage }) {
   }
   if (!size)
     return { ok: false, error: 'The spritesheet could not be decoded.' };
+  // The sheet's size settles the version (8×9 = v1, 8×11 = v2; no size is
+  // both), so a missing, odd or contradicting `spriteVersionNumber` never
+  // rejects a pet — Petdex itself labels pets by sheet size.
   const atlas = detectAtlas(size.width, size.height);
   if (!atlas) {
     return {
       ok: false,
       error: `The spritesheet is ${size.width}×${size.height}; expected an 8×9 or 8×11 grid of 192×208 cells (or a whole-pixel scale of it).`
-    };
-  }
-  if (
-    petJson.spriteVersionNumber !== null &&
-    petJson.spriteVersionNumber !== atlas.version
-  ) {
-    return {
-      ok: false,
-      error: `pet.json says sprite version ${petJson.spriteVersionNumber} but the image is a version ${atlas.version} atlas.`
     };
   }
   return {

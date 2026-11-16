@@ -13,7 +13,13 @@
  * area. Esc closes it. Navigation stays on ASK_PATH: other app-origin links
  * open in the main window, pet-store links in the store window, the rest in
  * the default browser (`openOutside`).
+ *
+ * "Answer ready" badge (round 3, 3b): `inBackground()` tells the controller
+ * whether an answer finished out of sight (window hidden, minimised or not
+ * focused); opening or focusing the window calls `onAttention` (the
+ * runtime clears the badge there).
  */
+import { isAppOrigin } from '../app-origin.mjs';
 import { ASK_PATH } from './contract.mjs';
 import { attachZoomKeys } from '../zoom-keys.mjs';
 
@@ -79,9 +85,25 @@ export function isCloseKey(input) {
 }
 
 /**
+ * true when an app path (`--pets-open=<path>`) is the ask page itself, so it
+ * opens the Ask window instead of the main window on that path.
+ * @param {unknown} path
+ */
+export function isAskPath(path) {
+  if (typeof path !== 'string' || !path.startsWith('/')) return false;
+  try {
+    const base = 'https://app.invalid';
+    const url = new URL(path, base);
+    return url.origin === base && url.pathname === ASK_PATH;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * What a navigation from the ask window does.
  * @param {string} url
- * @param {string} appOrigin
+ * @param {string | readonly string[]} appOrigin one origin or `appOriginsFor`'s list
  * @returns {{ kind: 'stay' } | { kind: 'main', path: string } | { kind: 'outside', url: string }}
  */
 export function askNavigation(url, appOrigin) {
@@ -91,7 +113,8 @@ export function askNavigation(url, appOrigin) {
   } catch {
     return { kind: 'outside', url };
   }
-  if (parsed.origin !== appOrigin) return { kind: 'outside', url: parsed.href };
+  if (!isAppOrigin(parsed.origin, appOrigin))
+    return { kind: 'outside', url: parsed.href };
   if (parsed.pathname === ASK_PATH) return { kind: 'stay' };
   return {
     kind: 'main',
@@ -104,7 +127,7 @@ export function askNavigation(url, appOrigin) {
  *   BrowserWindow: new (options: object) => any,
  *   screen: { getPrimaryDisplay: () => { workArea: Rect }, getDisplayMatching: (rect: Rect) => { workArea: Rect } },
  *   appUrl: string,
- *   appOrigin: string,
+ *   appOrigin: string | readonly string[],
  *   preloadPath: string,
  *   getPetRect: () => Rect|null,
  *   openMain: (path: string) => void,
@@ -113,7 +136,8 @@ export function askNavigation(url, appOrigin) {
  *   iconPath?: string,
  *   webPreferences?: object,
  *   onCreated?: (window: any) => void,
- *   onClosed?: () => void
+ *   onClosed?: () => void,
+ *   onAttention?: () => void
  * }} deps
  */
 export function createAskWindow(deps) {
@@ -130,7 +154,8 @@ export function createAskWindow(deps) {
     iconPath,
     webPreferences = {},
     onCreated = () => {},
-    onClosed = () => {}
+    onClosed = () => {},
+    onAttention = () => {}
   } = deps;
   const askUrl = new URL(ASK_PATH, appUrl).href;
   let win = null;
@@ -217,6 +242,8 @@ export function createAskWindow(deps) {
       if (win === window) win = null;
       onClosed();
     });
+    // The user is looking at the answer (clears the pet's badge).
+    window.on('focus', () => onAttention());
     onCreated(window);
     void window.loadURL(askUrl);
   }
@@ -228,10 +255,24 @@ export function createAskWindow(deps) {
         if (win.isMinimized?.()) win.restore();
         win.show();
         win.focus();
+        onAttention();
         return { ok: true };
       }
       create();
+      onAttention();
       return { ok: true };
+    },
+    /**
+     * The window is open but out of sight — hidden, minimised or not
+     * focused (an answer finishing now goes unseen). false when closed.
+     */
+    inBackground() {
+      if (!live()) return false;
+      return (
+        win.isVisible?.() === false ||
+        win.isMinimized?.() === true ||
+        win.isFocused?.() !== true
+      );
     },
     close() {
       if (live()) win.close();

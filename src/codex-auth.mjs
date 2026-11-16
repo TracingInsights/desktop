@@ -158,8 +158,72 @@ export function createCodexAuth(deps = {}) {
     now = () => Date.now()
   } = deps;
 
-  // In-memory device-auth state for the in-progress connection.
+  // In-memory device-auth state for the in-progress connection: a fresh
+  // object per flow, so a poll answered after a newer start (or after
+  // disconnect) can tell it is stale.
   let pendingDevice = null;
+  /** Bumped by every start and by disconnect: an older exchange must not save. */
+  let flows = 0;
+  /** The token refresh in flight (parallel calls share it). */
+  let refreshing = null;
+
+  const cancelled = () =>
+    inferenceError('aborted', {
+      providerMessage: 'Codex sign-in was cancelled.'
+    });
+
+  /** The stored credential is still the one this refresh started from. */
+  const stillStored = (credential) =>
+    credentialStore.load('codex')?.refreshToken === credential.refreshToken;
+
+  async function refreshCredential(credential) {
+    const body = new URLSearchParams({
+      client_id: CODEX_CLIENT_ID,
+      grant_type: 'refresh_token',
+      refresh_token: credential.refreshToken
+    });
+    const response = await fetchImpl(OAUTH_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        accept: 'application/json'
+      },
+      body
+    });
+    if (!response.ok) {
+      if (response.status === 400 || response.status === 401) {
+        // Not a credential the user connected again meanwhile.
+        if (stillStored(credential)) credentialStore.delete('codex');
+        return inferenceError('auth_expired', {
+          providerMessage: 'Codex authorization expired. Reconnect.'
+        });
+      }
+      return inferenceError('http_error', {
+        status: response.status,
+        providerMessage: `Codex token refresh failed (HTTP ${response.status}).`
+      });
+    }
+    const payload = await response.json();
+    // Disconnected (or replaced) meanwhile: never save it back.
+    if (!stillStored(credential)) {
+      return inferenceError('auth_expired', {
+        providerMessage: 'Codex is not connected.'
+      });
+    }
+    const refreshed = {
+      ...credential,
+      ...credentialFromTokens({
+        access_token: payload.access_token ?? credential.accessToken,
+        refresh_token: payload.refresh_token ?? credential.refreshToken,
+        id_token: payload.id_token ?? credential.idToken,
+        account_id: payload.account_id,
+        expires_in: payload.expires_in
+      }),
+      updatedAt: now()
+    };
+    credentialStore.save('codex', refreshed);
+    return { ok: true, credential: refreshed };
+  }
 
   return {
     async status() {
@@ -173,6 +237,7 @@ export function createCodexAuth(deps = {}) {
     },
 
     async startDeviceAuth() {
+      const flow = ++flows;
       const response = await fetchImpl(`${DEVICE_AUTH_BASE}/usercode`, {
         method: 'POST',
         headers: {
@@ -188,6 +253,7 @@ export function createCodexAuth(deps = {}) {
         });
       }
       const payload = await response.json();
+      if (flow !== flows) return cancelled();
       const userCode = payload.user_code ?? payload.usercode;
       const deviceAuthId = payload.device_auth_id ?? payload.device_code;
       if (!deviceAuthId || !userCode) {
@@ -196,6 +262,7 @@ export function createCodexAuth(deps = {}) {
         });
       }
       pendingDevice = {
+        flow,
         deviceAuthId,
         userCode,
         intervalSeconds: parseInterval(payload.interval)
@@ -210,7 +277,8 @@ export function createCodexAuth(deps = {}) {
     },
 
     async pollDeviceAuth() {
-      if (!pendingDevice) {
+      const device = pendingDevice;
+      if (!device) {
         return inferenceError('invalid_request', {
           providerMessage: 'No Codex device authorization in progress.'
         });
@@ -222,11 +290,19 @@ export function createCodexAuth(deps = {}) {
           accept: 'application/json'
         },
         body: JSON.stringify({
-          device_auth_id: pendingDevice.deviceAuthId,
-          user_code: pendingDevice.userCode
+          device_auth_id: device.deviceAuthId,
+          user_code: device.userCode
         })
       });
       const payload = await readJson(response);
+      // A newer start or a disconnect while this poll was out.
+      if (pendingDevice !== device) {
+        return {
+          ok: true,
+          status: 'expired',
+          message: 'Codex sign-in was cancelled.'
+        };
+      }
 
       if (payload.status === 'pending') {
         return { ok: true, status: 'pending' };
@@ -264,7 +340,8 @@ export function createCodexAuth(deps = {}) {
         pendingDevice = null;
         const exchange = await this.connectFromAuthorization(
           authorizationCode,
-          codeVerifier
+          codeVerifier,
+          () => flows === device.flow
         );
         if (!exchange.ok) return exchange;
         return {
@@ -309,8 +386,15 @@ export function createCodexAuth(deps = {}) {
       });
     },
 
-    /** Exchange an authorization code for tokens and persist them. */
-    async connectFromAuthorization(authorizationCode, codeVerifier) {
+    /**
+     * Exchange an authorization code for tokens and persist them — unless
+     * `isCurrent()` turned false meanwhile (disconnect / a newer sign-in).
+     */
+    async connectFromAuthorization(
+      authorizationCode,
+      codeVerifier,
+      isCurrent = () => true
+    ) {
       const body = new URLSearchParams({
         grant_type: 'authorization_code',
         code: authorizationCode,
@@ -333,6 +417,7 @@ export function createCodexAuth(deps = {}) {
         });
       }
       const credential = credentialFromTokens(await response.json());
+      if (!isCurrent()) return cancelled();
       credentialStore.save('codex', credential);
       return { ok: true, accountId: credential.accountId };
     },
@@ -353,13 +438,14 @@ export function createCodexAuth(deps = {}) {
 
     async disconnect() {
       pendingDevice = null;
+      flows += 1;
       credentialStore.delete('codex');
     },
 
     /**
      * Load the credential, refreshing lazily when `expiresAt <= now + skew`.
      * Terminal refresh failures (400/401) clear the stored credential and
-     * surface `auth_expired`.
+     * surface `auth_expired`. Parallel calls share one refresh.
      */
     async resolveCredential() {
       let credential = credentialStore.load('codex');
@@ -369,47 +455,13 @@ export function createCodexAuth(deps = {}) {
         });
       }
       credential = normalizeCredential(credential);
-      if (shouldRefresh(credential)) {
-        const body = new URLSearchParams({
-          client_id: CODEX_CLIENT_ID,
-          grant_type: 'refresh_token',
-          refresh_token: credential.refreshToken
-        });
-        const response = await fetchImpl(OAUTH_TOKEN_URL, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/x-www-form-urlencoded',
-            accept: 'application/json'
-          },
-          body
-        });
-        if (!response.ok) {
-          if (response.status === 400 || response.status === 401) {
-            credentialStore.delete('codex');
-            return inferenceError('auth_expired', {
-              providerMessage: 'Codex authorization expired. Reconnect.'
-            });
-          }
-          return inferenceError('http_error', {
-            status: response.status,
-            providerMessage: `Codex token refresh failed (HTTP ${response.status}).`
-          });
-        }
-        const payload = await response.json();
-        credential = {
-          ...credential,
-          ...credentialFromTokens({
-            access_token: payload.access_token ?? credential.accessToken,
-            refresh_token: payload.refresh_token ?? credential.refreshToken,
-            id_token: payload.id_token ?? credential.idToken,
-            account_id: payload.account_id,
-            expires_in: payload.expires_in
-          }),
-          updatedAt: now()
-        };
-        credentialStore.save('codex', credential);
-      }
-      return { ok: true, credential };
+      if (!shouldRefresh(credential)) return { ok: true, credential };
+      // One refresh at a time: a second POST of the same refresh token would
+      // be rejected (rotation) and that 400 would delete the credential.
+      refreshing ??= refreshCredential(credential).finally(() => {
+        refreshing = null;
+      });
+      return refreshing;
     }
   };
 }

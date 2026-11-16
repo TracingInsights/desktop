@@ -54,7 +54,8 @@ export function isPetZipDownload(filename, totalBytes) {
  *   openExternal: (url: string) => void,
  *   downloadDir: string,
  *   onPetDownload: (path: string) => void,
- *   iconPath?: string
+ *   iconPath?: string,
+ *   onClosed?: () => void
  * }} deps
  */
 export function createPetStoreWindow({
@@ -64,7 +65,8 @@ export function createPetStoreWindow({
   openExternal,
   downloadDir,
   onPetDownload,
-  iconPath
+  iconPath,
+  onClosed = () => {}
 }) {
   let win = null;
   let storeSession = null;
@@ -184,8 +186,10 @@ export function createPetStoreWindow({
       if (command === 'browser-forward' && history.canGoForward())
         history.goForward();
     });
-    win.on('closed', () => {
-      win = null;
+    const window = win;
+    window.on('closed', () => {
+      if (win === window) win = null;
+      onClosed();
     });
   }
 

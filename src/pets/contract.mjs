@@ -14,7 +14,7 @@
 export const SPRITE_COLUMNS = 8;
 export const SPRITE_FRAME_WIDTH = 192;
 export const SPRITE_FRAME_HEIGHT = 208;
-/** Atlas rows per sprite version: v1 = 8×9, v2 = 8×11 (rows 9–10 unused). */
+/** Atlas rows per sprite version: v1 = 8×9, v2 = 8×11 (rows 9–10: look-a / look-b). */
 export const ATLAS_ROWS = Object.freeze({ 1: 9, 2: 11 });
 
 /** Animation rows (Petdex src/lib/pet-states.ts, MIT). */
@@ -27,7 +27,12 @@ export const PET_STATES = Object.freeze([
   { id: 'failed', row: 5, frames: 8, durationMs: 1220 },
   { id: 'waiting', row: 6, frames: 6, durationMs: 1010 },
   { id: 'running', row: 7, frames: 6, durationMs: 820 },
-  { id: 'review', row: 8, frames: 6, durationMs: 1030 }
+  { id: 'review', row: 8, frames: 6, durationMs: 1030 },
+  // Petdex v2 sheets only (`minRows`): two 8-frame "look around" rows with no
+  // published name — row 9 turns the head one way, row 10 the other
+  // (checked 2026-11-11 on three v2 pets). Ambient one-shots (behaviour.mjs).
+  { id: 'look-a', row: 9, frames: 8, durationMs: 1120, minRows: 11 },
+  { id: 'look-b', row: 10, frames: 8, durationMs: 1120, minRows: 11 }
 ]);
 export const PET_STATE_IDS = Object.freeze(PET_STATES.map((s) => s.id));
 
@@ -47,8 +52,15 @@ export const LIMITS = Object.freeze({
 });
 
 // --- Pet ids ---
-// "petdex:<slug>" | "codex:<folder>" | "import:<uuid>"
-export const PET_SOURCES = Object.freeze(['petdex', 'codex', 'import']);
+// "petdex:<slug>" | "codex:<folder>" | "import:<uuid>" | "petdex-cli:<folder>"
+// codex = `<codexHome>/pets`, petdex-cli = `~/.petdex/pets` (what `npx petdex
+// install` and Petdex Desktop write); both read-only, scanned when scanCodexDir.
+export const PET_SOURCES = Object.freeze([
+  'petdex',
+  'codex',
+  'import',
+  'petdex-cli'
+]);
 
 // --- Settings (plan §4.1) ---
 
@@ -61,6 +73,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
   size: 'm',
   chatReactions: true,
   sessionReactions: 'calm',
+  /** Round 3 (2a): wander along the screen while idle + the lights-out dash (roam.mjs). */
+  roam: false,
   quietUntil: null,
   closeToTray: true,
   launchAtLogin: false,
@@ -87,7 +101,12 @@ export const DEFAULT_SETTINGS = Object.freeze({
   /** Internal once-only markers (not page-writable). */
   lastResultKey: null,
   lastRateKey: null,
-  lastFactDay: null
+  lastFactDay: null,
+  // --- Round 3 (owner request 2026-11-11) ---
+  /** Race-weekend greeting: once per local morning / evening before a session. */
+  greetings: true,
+  /** Internal once-only marker "<local date>:<morning|evening>" (not page-writable). */
+  lastGreetingKey: null
 });
 
 /** Keys the page may change through `pets:updateSettings`. */
@@ -96,6 +115,7 @@ export const PAGE_WRITABLE_SETTINGS = Object.freeze([
   'size',
   'chatReactions',
   'sessionReactions',
+  'roam',
   'closeToTray',
   'launchAtLogin',
   'scanCodexDir',
@@ -103,7 +123,8 @@ export const PAGE_WRITABLE_SETTINGS = Object.freeze([
   'followFavorite',
   'resultReactions',
   'dailyFact',
-  'rateNudge'
+  'rateNudge',
+  'greetings'
 ]);
 
 // --- Chat activity signals (plan §4.5 row 4) ---
@@ -174,6 +195,40 @@ export const CELEBRATE_TEXT_CHARS = 120;
 /** Quick-ask window: a small app-origin page next to the pet. */
 export const ASK_PATH = '/desktop/ask';
 
+// --- Bubble buttons, click panel, answer badge (round 3: 2e, 3a, 3b) ---
+
+/**
+ * Buttons under a bubble (`bubbleActions` in the render payload, ≤ 3):
+ * dismiss it, quiet for an hour / until the session ends (the tray's
+ * Quiet ▸ helpers), switch this bubble kind off. Hover bubbles have none.
+ */
+export const BUBBLE_ACTION_IDS = Object.freeze([
+  'ok',
+  'quiet-1h',
+  'quiet-session',
+  'mute'
+]);
+/** The click panel's quick actions (`panel.actions`), in display order. */
+export const PANEL_ACTION_IDS = Object.freeze([
+  'ask',
+  'rate',
+  'stats',
+  'hot-lap',
+  'pets'
+]);
+/**
+ * `panelAction` id with no button: the renderer closes the panel (Escape,
+ * the window lost focus, PANEL_IDLE_MS without the pointer inside).
+ */
+export const PANEL_CLOSE_ID = 'close';
+/** The renderer closes the panel after this long without the pointer inside. */
+export const PANEL_IDLE_MS = 20 * 1000;
+/** Render payload `badge` while an Ask-window answer waits unseen. */
+export const ANSWER_BADGE = Object.freeze({
+  kind: 'answer',
+  label: 'Answer ready'
+});
+
 // --- Petdex (plan §4.3) ---
 
 export const PETDEX_ORIGIN = 'https://petdex.dev';
@@ -226,14 +281,35 @@ export const PET_WINDOW_CHANNELS = Object.freeze({
   hover: 'pet:hover',
   contextMenu: 'pet:contextMenu',
   bubbleClick: 'pet:bubbleClick',
+  /** pet → main: `{ id }`, one of BUBBLE_ACTION_IDS (a bubble button). */
+  bubbleAction: 'pet:bubbleAction',
+  /** pet → main: `{ id }`, one of PANEL_ACTION_IDS or PANEL_CLOSE_ID. */
+  panelAction: 'pet:panelAction',
   /**
    * main → pet: { state, row, frames, durationMs, once, still, playKey,
    * bubble, size, atlas: { url, rows, scale }, box: { width, height,
-   * spriteLeft, spriteTop, spriteWidth, spriteHeight, bubble: 'above'|'below'|null },
+   * spriteLeft, spriteTop, spriteWidth, spriteHeight, bubble: 'above'|'below'|null,
+   * panel: 'above'|'below'|null },
    * second: null | { url, rows, scale } } — duo: the second sprite plays the
    * same state beside the first (pet-window.mjs widens the box) }
    * (`still` = frame 0 without animating; a new `playKey` restarts a
    * one-shot; `box` = layout inside the window, from pet-window.mjs).
+   * Duo reactions (4b): `secondAnim: null | { state, row, frames,
+   * durationMs, once, still, playKey, delayMs }` — the second sprite's own
+   * animation (null = it plays the first's; its own `playKey` restarts only
+   * that sprite; `delayMs` > 0 holds the row's first frame that long first).
+   * Round 3: `motion: null | 'roam' | 'dash'` (2a; null while the click
+   * panel is open) — the renderer may walk the window (roam.mjs); while it
+   * walks both sprites show
+   * running-left/right (no `secondAnim`) instead of the payload's rows,
+   * then those rows again when it stops.
+   * Round 3: `sleeping: boolean` (absent = false) — the ambient sleep, always
+   * with `still`; renderers draw a "z z" mark next to the head.
+   * Round 3 (2e / 3a / 3b), each null when absent:
+   *   bubbleActions: null | { id, label }[]   — buttons under the bubble
+   *   panel: null | { lines: string[], actions: { id, label }[] } — the
+   *     click panel, shown instead of the bubble (bubble is null then)
+   *   badge: null | { kind: 'answer', label } — dot at the pet's top-right
    */
   render: 'pet:render'
 });

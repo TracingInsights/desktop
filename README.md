@@ -21,11 +21,18 @@ LM Studio / vLLM / llama.cpp on `127.0.0.1`) or a hosted OpenAI-compatible
 endpoint (Fireworks, Together, DeepInfra, …), speaking one of three wire
 protocols (`openai-completions`, `openai-responses`, `anthropic-messages`).
 
+The tif1 fine-tuned model also runs **in the window itself** over WebGPU
+(provider "In-browser (WebGPU)", `docs/browser-model.md`): its requests stay
+in the renderer (the engine lives in the page), never in the main-process
+harness. Settings → AI provider → On-device model chooses between it and a
+llama-server custom provider (`docs/local-model.md`); the default is
+`DESKTOP_LOCAL_RUNTIME_DEFAULT` in `src/lib/ai/webgpu/settings.svelte.ts`.
+
 ## How it works
 
 ```
 ┌────────────────────────────── Electron ────────────────────────────────┐
-│ BrowserWindow ── loads https://app.tracinginsights.com ──┐            │
+│ BrowserWindow ── loads https://tracinginsights.com ──────┐            │
 │                                                          │            │
 │   window.tif1aiDesktop (preload, contextIsolation+sandbox)│            │
 │     ipcRenderer.invoke('providers:*' | 'codex:*' |        │            │
@@ -102,7 +109,7 @@ always-on-top window (`src/pets/`, bundled page `src/pet/`). As-built doc:
   pet — Petdex, Codex folder or import — passes `src/pets/pet-validate.mjs`
   first. The pet window loads only bundled files and `pet-asset://` sprites.
 - **Reactions**: chat activity from the page (`pets.signal`), the F1
-  calendar from `https://app.tracinginsights.com/desktop/schedule.json`
+  calendar from `https://tracinginsights.com/desktop/schedule.json`
   (fetched on launch and every 24 h, cached in `userData`) as speech bubbles
   only — never OS notifications. "During sessions" = Calm (default) /
   Lively / Off; Quiet for 1 h or until the session ends from the pet's
@@ -142,7 +149,7 @@ always-on-top window (`src/pets/`, bundled page `src/pet/`). As-built doc:
 ```bash
 cd desktop
 bun install            # downloads the Electron binary
-bun run start          # launches against https://app.tracinginsights.com
+bun run start          # launches against https://tracinginsights.com
 
 # point at a local dev server instead:
 TIF1AI_APP_URL=http://127.0.0.1:5173 bun run start

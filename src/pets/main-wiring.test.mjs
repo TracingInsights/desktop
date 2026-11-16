@@ -10,6 +10,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PET_WINDOW_CHANNELS, PETS_CHANNELS } from './contract.mjs';
 import { PET_STORE_PARTITION } from './store-window.mjs';
+import {
+  INSTALL_UPDATE_ARG,
+  OPEN_ARG_PREFIX,
+  REFRESH_ARG
+} from './native-protocol.mjs';
 
 const userData = mkdtempSync(join(tmpdir(), 'pets-main-'));
 const realFetch = globalThis.fetch;
@@ -409,6 +414,78 @@ describe('main.mjs pets wiring (electron mocked)', () => {
     ).rejects.toThrow();
   });
 
+  test('OpenRouter sign-in stays in the window; other sites open outside', () => {
+    const win = mainWindows().at(-1);
+    const prevented = (url) => {
+      let result = false;
+      win.webContents.handlers.get('will-navigate')(
+        { preventDefault: () => (result = true) },
+        url
+      );
+      return result;
+    };
+    expect(
+      prevented('https://openrouter.ai/auth?callback_url=x&code_challenge=y')
+    ).toBe(false);
+    expect(prevented('https://openrouter.ai/sign-up?redirect_url=z')).toBe(
+      false
+    );
+    expect(prevented('https://clerk.openrouter.ai/v1/client')).toBe(false);
+    expect(prevented('https://github.com/login/oauth/authorize')).toBe(false);
+    expect(prevented('https://evil.openrouter.ai.example/')).toBe(true);
+    expect(prevented('https://example.com/')).toBe(true);
+  });
+
+  test('a settings write the tray cannot show (a walk saving its position) keeps the tray menu', async () => {
+    const win = mainWindows().at(-1);
+    const tray = trays.at(-1);
+    let builds = 0;
+    tray.setContextMenu = (menu) => {
+      builds += 1;
+      tray.menu = menu;
+    };
+    const { roam } = (await invoke(PETS_CHANNELS.status, win)).status.settings;
+    expect(roam).toBe(false);
+    // Written again unchanged (like a position-only save): no rebuild.
+    expect(
+      (await invoke(PETS_CHANNELS.updateSettings, win, { roam: false })).ok
+    ).toBe(true);
+    expect(builds).toBe(0);
+    expect(
+      (await invoke(PETS_CHANNELS.updateSettings, win, { roam: true })).ok
+    ).toBe(true);
+    expect(builds).toBe(1);
+    await invoke(PETS_CHANNELS.updateSettings, win, { roam: false });
+    delete tray.setContextMenu;
+  });
+
+  test('another refresh run (the pet timer) neither opens nor focuses the app', () => {
+    const win = mainWindows().at(-1);
+    const count = windows.length;
+    let focused = false;
+    win.show = win.focus = () => (focused = true);
+    events.get('second-instance')({}, ['app', REFRESH_ARG]);
+    expect(focused).toBe(false);
+    expect(windows.length).toBe(count);
+    delete win.show;
+    delete win.focus;
+  });
+
+  test('"Restart to update" with no update disarms: a later download only offers it', () => {
+    const installs = () =>
+      appCalls.filter((call) => call === 'quitAndInstall').length;
+    expect(installs()).toBe(0);
+    const before = notifications.length;
+    events.get('second-instance')({}, ['app', INSTALL_UPDATE_ARG]);
+    updaterEvents.get('update-not-available')({ version: '0.2.0' });
+    // A background check downloads one later: no silent restart.
+    updaterEvents.get('update-downloaded')({ version: '0.2.9' });
+    expect(installs()).toBe(0);
+    expect(notifications.slice(before).map((n) => n.title)).toEqual([
+      'Update ready'
+    ]);
+  });
+
   test('notifications off: no update / import notices; the tray and app menu still offer the update', async () => {
     const win = mainWindows().at(-1);
     const setNotifications = async (value) =>
@@ -490,5 +567,116 @@ describe('main.mjs pets wiring (electron mocked)', () => {
     ).toBe(true);
     win.close();
     expect(appCalls).toContain('quit');
+  });
+});
+
+/** Start another copy of main.mjs on the same fakes with extra argv. */
+async function coldStart(tag, args, { packaged = false } = {}) {
+  process.argv.push(...args);
+  fakeApp.isPackaged = packaged;
+  try {
+    await import(`../main.mjs?${tag}`);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  } finally {
+    process.argv.splice(process.argv.length - args.length, args.length);
+    fakeApp.isPackaged = false;
+  }
+}
+
+describe('main.mjs cold starts (electron mocked)', () => {
+  test('--pets-install-update stays windowless until the check fails, then shows the app', async () => {
+    const count = mainWindows().length;
+    const installs = () =>
+      appCalls.filter((call) => call === 'quitAndInstall').length;
+    const installed = installs();
+    await coldStart('install-update', [INSTALL_UPDATE_ARG], { packaged: true });
+    expect(mainWindows().length).toBe(count);
+    const error = console.error;
+    console.error = () => {};
+    try {
+      updaterEvents.get('error')(new Error('offline'));
+    } finally {
+      console.error = error;
+    }
+    expect(mainWindows().length).toBe(count + 1);
+    updaterEvents.get('update-downloaded')({ version: '0.5.0' });
+    expect(installs()).toBe(installed);
+  });
+
+  /** Cold start with "Restart to update" armed, then open + close the app. */
+  async function closeDuringArmedInstall(tag) {
+    await coldStart(tag, [INSTALL_UPDATE_ARG], { packaged: true });
+    events.get('second-instance')({}, ['app']);
+    const win = mainWindows().at(-1);
+    expect(win.destroyed).toBe(false);
+    expect(
+      (await invoke(PETS_CHANNELS.updateSettings, win, { closeToTray: false }))
+        .ok
+    ).toBe(true);
+    const quits = appCalls.filter((call) => call === 'quit').length;
+    const count = mainWindows().length;
+    win.close();
+    // Quitting now would drop the install: the app stays, windowless.
+    expect(appCalls.filter((call) => call === 'quit').length).toBe(quits);
+    return { quits, count };
+  }
+
+  test('a close during an armed install waits, then the download installs', async () => {
+    const installs = () =>
+      appCalls.filter((call) => call === 'quitAndInstall').length;
+    const installed = installs();
+    await closeDuringArmedInstall('install-close');
+    expect(installs()).toBe(installed);
+    updaterEvents.get('update-downloaded')({ version: '0.6.0' });
+    expect(installs()).toBe(installed + 1);
+  });
+
+  test('a close during an armed install, then a cancel, closes as it would have', async () => {
+    const { quits, count } = await closeDuringArmedInstall('install-cancel');
+    updaterEvents.get('update-not-available')({ version: '0.2.0' });
+    // closeToTray off → the quit the close held back; no window reopens.
+    expect(appCalls.filter((call) => call === 'quit').length).toBeGreaterThan(
+      quits
+    );
+    expect(mainWindows().length).toBe(count);
+  });
+
+  test('a refresh run ignores another refresh; once promoted, macOS activate reopens the app', async () => {
+    events.delete('activate');
+    await coldStart('refresh', [REFRESH_ARG]);
+    const count = mainWindows().length;
+    events.get('activate')();
+    events.get('second-instance')({}, ['app', REFRESH_ARG]);
+    expect(mainWindows().length).toBe(count);
+    // A real second start promotes the run into the app.
+    events.get('second-instance')({}, ['app']);
+    expect(mainWindows().length).toBe(count + 1);
+    mainWindows().at(-1).close();
+    events.get('activate')();
+    expect(mainWindows().length).toBe(count + 2);
+    expect(mainWindows().at(-1).destroyed).toBe(false);
+  });
+
+  test('--pets-open=/desktop/ask opens the Ask window, never a main window on that path', async () => {
+    const asks = () =>
+      windows.filter((w) => w.options.title?.startsWith('Ask an F1 question'));
+    const mains = mainWindows().length;
+    const before = asks().length;
+    // The native pet's offline "Ask F1" / "Ask an F1 question…" (cold start).
+    await coldStart('pets-open-ask', [`${OPEN_ARG_PREFIX}/desktop/ask`]);
+    expect(asks().length).toBe(before + 1);
+    expect(asks().at(-1).url).toBe(`${APP_URL}/desktop/ask`);
+    expect(mainWindows().length).toBe(mains);
+    // Again while running (second instance, with a query): the same window.
+    events.get('second-instance')({}, [
+      'app',
+      `${OPEN_ARG_PREFIX}/desktop/ask?from=pet`
+    ]);
+    expect(asks().length).toBe(before + 1);
+    expect(mainWindows().length).toBe(mains);
+    // Any other path still opens the main window there.
+    events.get('second-instance')({}, ['app', `${OPEN_ARG_PREFIX}/stats`]);
+    expect(mainWindows().length).toBe(mains + 1);
+    expect(mainWindows().at(-1).url).toBe(`${APP_URL}/stats`);
   });
 });

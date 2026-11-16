@@ -132,6 +132,40 @@ describe('createPetRenderer', () => {
     expect(renderer.reason()).toBe('crash-loop');
   });
 
+  test('can(): Electron draws panel + badge; a native pet only what it says; pending nothing', async () => {
+    const log = [];
+    let resolve;
+    const older = fakeNative(
+      log,
+      new Promise((r) => {
+        resolve = r;
+      })
+    );
+    const renderer = createPetRenderer({
+      native: older,
+      electronWindow: fakeWindow('electron', log)
+    });
+    const started = renderer.start();
+    expect(renderer.can('panel')).toBe(false);
+    resolve({ ok: true, reason: null });
+    await started;
+    // An older ti-pet without `can` draws neither.
+    expect(renderer.can('panel')).toBe(false);
+    expect(renderer.can('badge')).toBe(false);
+    older.can = (feature) => feature === 'badge';
+    expect(renderer.can('panel')).toBe(false);
+    expect(renderer.can('badge')).toBe(true);
+    renderer.fallback('crash-loop');
+    expect(renderer.can('panel')).toBe(true);
+    expect(renderer.can('badge')).toBe(true);
+
+    const plain = createPetRenderer({
+      native: null,
+      electronWindow: { ...fakeWindow('electron', log), can: () => false }
+    });
+    expect(plain.can('panel')).toBe(false);
+  });
+
   test('TIF1AI_PETS_RENDERER=electron (forceElectron) never starts the native pet', async () => {
     const log = [];
     let started = false;

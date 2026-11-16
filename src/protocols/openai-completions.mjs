@@ -13,6 +13,7 @@
  */
 import {
   SseDecoder,
+  createStreamWatchdog,
   fetchWithValidatedRedirects,
   inferenceError,
   isReasoningParamError,
@@ -35,12 +36,6 @@ import {
 } from './completions-text.mjs';
 
 const PROTOCOL = 'openai-completions';
-
-function networkError(message) {
-  const err = new Error(message);
-  err.code = 'network';
-  return err;
-}
 
 function resultFromMessage(payload) {
   const choice = payload?.choices?.[0];
@@ -96,53 +91,13 @@ async function callOnce({
   idleTimeoutMs,
   firstTokenTimeoutMs
 }) {
-  // Timeouts live in a private controller combined with the caller's signal,
-  // so either an explicit abort(requestId) or an internal expiry tears the
-  // fetch down. A timeout aborts with a sentinel Error to distinguish it from
-  // a user abort (the caller's signal may carry its own abort reason).
-  const timeoutController = new AbortController();
-  const combined = signal
-    ? AbortSignal.any([signal, timeoutController.signal])
-    : timeoutController.signal;
-
-  let idleTimer;
-  let firstTokenTimer;
-  const armIdle = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = null;
-    // The first-token grace governs until the first token arrives.
-    if (firstTokenTimer) return;
-    if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) return;
-    idleTimer = setTimeout(
-      () =>
-        timeoutController.abort(
-          networkError('Provider stream was idle for too long.')
-        ),
-      idleTimeoutMs
-    );
-  };
-  const armFirstToken = () => {
-    if (!Number.isFinite(firstTokenTimeoutMs) || firstTokenTimeoutMs <= 0)
-      return;
-    firstTokenTimer = setTimeout(
-      () =>
-        timeoutController.abort(
-          networkError('Timed out waiting for the first token.')
-        ),
-      firstTokenTimeoutMs
-    );
-  };
-  const clearFirst = () => {
-    if (firstTokenTimer) clearTimeout(firstTokenTimer);
-    firstTokenTimer = null;
-  };
-
-  // Watchdogs: the first-token grace (model cold-load) is armed BEFORE the
-  // request, so a hung connect / header wait / blocking (non-stream) call is
-  // bounded too. The idle watchdog only takes over once the first token has
-  // arrived — arming both at stream start let the shorter idle timeout fire
-  // during a legitimate cold load and pre-empt the grace period.
-  armFirstToken();
+  const watchdog = createStreamWatchdog({
+    signal,
+    idleTimeoutMs,
+    firstTokenTimeoutMs
+  });
+  const { armIdle, clearFirst } = watchdog;
+  watchdog.armFirstToken();
   try {
     const response = await fetchWithValidatedRedirects(fetchImpl, url, {
       method: 'POST',
@@ -154,7 +109,7 @@ async function callOnce({
         ...headers
       },
       body: JSON.stringify(body),
-      signal: combined
+      signal: watchdog.signal
     });
 
     if (!response.ok) {
@@ -288,8 +243,7 @@ async function callOnce({
       reader.releaseLock();
     }
   } finally {
-    clearTimeout(idleTimer);
-    clearFirst();
+    watchdog.dispose();
   }
 }
 
