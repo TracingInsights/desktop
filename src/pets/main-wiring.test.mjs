@@ -5,7 +5,7 @@
  * IPC trust after the main window is recreated.
  */
 import { describe, test, expect, mock, afterAll } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PET_WINDOW_CHANNELS, PETS_CHANNELS } from './contract.mjs';
@@ -21,6 +21,9 @@ const realFetch = globalThis.fetch;
 const realAppUrl = process.env.TIF1AI_APP_URL;
 afterAll(() => {
   rmSync(userData, { recursive: true, force: true });
+  if (hadResourcesPath) process.resourcesPath = previousResourcesPath;
+  else delete process.resourcesPath;
+  rmSync(resourcesDir, { recursive: true, force: true });
   globalThis.fetch = realFetch;
   if (realAppUrl === undefined) delete process.env.TIF1AI_APP_URL;
   else process.env.TIF1AI_APP_URL = realAppUrl;
@@ -177,7 +180,8 @@ const fakeApp = {
   exit: (code) => appCalls.push(['exit', code]),
   relaunch: (o) => appCalls.push(['relaunch', o]),
   setLoginItemSettings: () => {},
-  getLoginItemSettings: () => ({ wasOpenedAtLogin: false })
+  getLoginItemSettings: () => ({ wasOpenedAtLogin: false }),
+  commandLine: { appendSwitch() {} }
 };
 
 mock.module('electron', () => ({
@@ -254,6 +258,13 @@ mock.module('electron-updater', () => ({
   }
 }));
 
+// A packaged .deb (resources/package-type), so the updater is set up
+// (src/update-support.mjs): a tar.gz / Flatpak / portable copy has none.
+const resourcesDir = mkdtempSync(join(tmpdir(), 'main-wiring-resources-'));
+writeFileSync(join(resourcesDir, 'package-type'), 'deb');
+const hadResourcesPath = 'resourcesPath' in process;
+const previousResourcesPath = process.resourcesPath;
+process.resourcesPath = resourcesDir;
 const main = await import('../main.mjs');
 readyResolve();
 await ready;

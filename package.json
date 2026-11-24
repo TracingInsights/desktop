@@ -1,6 +1,6 @@
 {
   "name": "tif1ai-desktop",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "description": "TracingInsights desktop app — a main-process inference harness that lets ChatGPT Codex, Grok (SuperGrok), and user-supplied custom providers run through the user's machine instead of the server.",
   "author": {
@@ -18,7 +18,7 @@
     "dist": "electron-builder",
     "dist:mac": "electron-builder --mac",
     "dist:win": "electron-builder --win",
-    "dist:linux": "electron-builder --linux",
+    "dist:linux": "bun run scripts/linux-release.mjs",
     "publish:release": "bun run scripts/publish-release.mjs",
     "test": "bun test",
     "smoke": "bun run scripts/harness-smoke.mjs",

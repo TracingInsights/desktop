@@ -2,9 +2,11 @@
 #   bun install
 #   bun run icons             # regenerate build/icon.{png,icns,ico} from assets/icon.png
 #   bun run pack              # unpacked build in release/ (fast, for testing)
-#   bun run dist:mac          # dmg + zip
-#   bun run dist:win          # nsis installer
-#   bun run dist:linux        # AppImage + deb
+#   bun run dist:mac          # dmg (arm64, x64, universal) + zip (arm64, x64)
+#   bun run dist:win          # nsis installer + portable exe (x64, arm64)
+#   bun run dist:linux        # AppImage + deb + rpm + tar.gz via
+#                             # scripts/linux-release.mjs (one run per
+#                             # package type; --arch arm64, --skip rpm)
 #   bun run publish:release   # mirror desktop/ to the public releases repo and
 #                             # tag vX.Y.Z — its Actions workflow builds +
 #                             # publishes the release (see desktop/README.md)
@@ -21,10 +23,17 @@
 # desktop/scripts/publish-release.mjs and desktop/README.md →
 # "Releases & auto-update".
 #
-# Artifact names carry NO version (${productName}-${os}.${ext}) so the site
-# can deep-link the latest installers via GitHub's stable
-# /releases/latest/download/<name> URLs (src/lib/ai/desktop-bridge.ts
-# DESKTOP_DOWNLOAD_LINKS — keep the two in sync).
+# Artifact names carry NO version so the site can deep-link the latest
+# installers via GitHub's stable /releases/latest/download/<name> URLs
+# (src/lib/desktop-downloads/catalog.ts on the site — keep the two in sync).
+# Where one build writes several arches into ONE update file (Windows
+# latest.yml, latest-mac.yml) the names must carry the arch: electron-updater
+# picks the file whose name contains process.arch ("x64" / "arm64").
+# Linux x64 keeps the plain ${productName}-linux.<ext> names (one arch per
+# latest-linux*.yml); the release workflow's arm64 job overrides
+# linux.artifactName with -linux-arm64. The pre-0.2.4 names
+# TracingInsights-mac.dmg (universal) and TracingInsights-win.exe (x64
+# installer) are re-uploaded as copies by the workflow so old links resolve.
 #
 # TODO (before first public release):
 #   - Code signing: macOS Developer ID + notarization and Windows
@@ -67,15 +76,18 @@ publish:
 mac:
   icon: build/icon.icns
   category: public.app-category.utilities
-  # Universal binaries: one dmg/zip serves Apple Silicon and Intel, so the
-  # site's single macOS download link works for everyone. Safe here because
-  # the app has no native modules (pure JS + Electron's own prebuilds); the
-  # native pet ships both arch binaries side by side (see x64ArchFiles).
+  # Apple Silicon and Intel builds (smaller downloads) plus a universal dmg
+  # for anyone unsure of their chip. Universal is safe because the app has no
+  # native modules (pure JS + Electron's own prebuilds); the native pet ships
+  # both arch binaries side by side (see x64ArchFiles). Only the per-arch zips
+  # are update payloads (MacUpdater prefers arm64 files on Apple Silicon and
+  # drops them on Intel), so latest-mac.yml never points at the universal one.
+  artifactName: ${productName}-mac-${arch}.${ext}
   target:
     - target: dmg
-      arch: [universal]
+      arch: [arm64, x64, universal]
     - target: zip
-      arch: [universal]
+      arch: [arm64, x64]
   # Both native pet binaries ship in Resources/ti-pet/ (main.mjs picks
   # ti-pet-darwin-<process.arch>), so they are identical in the x64 and arm64
   # slices; @electron/universal refuses identical Mach-O files it is not told
@@ -85,13 +97,25 @@ mac:
 win:
   icon: build/icon.ico
   target:
-    - nsis
+    - target: nsis
+      arch: [x64, arm64]
+    - target: portable
+      arch: [x64, arm64]
 linux:
   icon: build/icon.png
+  # Build these through scripts/linux-release.mjs (one electron-builder run
+  # per package type), not `electron-builder --linux`: one run packs them in
+  # parallel from one folder that the deb / rpm `package-type` marker is
+  # written into. The Flatpak is built by its own release job
+  # (`--linux flatpak`): it needs flatpak-builder + the Flathub runtimes, and
+  # a failure there must not stop the other packages.
   target:
     - AppImage
     - deb
+    - rpm
+    - tar.gz
   category: Utility
+  synopsis: F1 statistics, telemetry and an AI chat that runs through your machine
 deb:
   # electron-builder's defaults (FpmTarget) + what the native pet needs: GTK 4
   # and the WebP loader for gdk-pixbuf (Petdex sprites are WebP). Setting
@@ -111,3 +135,35 @@ deb:
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
+  # One installer per arch (not one installer carrying both): both land in
+  # latest.yml and electron-updater picks the one named for process.arch.
+  buildUniversalInstaller: false
+  artifactName: ${productName}-win-${arch}.${ext}
+# Portable exe: runs without installing, never self-updates (PortableTarget
+# writes no update info; src/update-support.mjs turns the updater off when
+# PORTABLE_EXECUTABLE_DIR is set).
+portable:
+  buildUniversalInstaller: false
+  artifactName: ${productName}-win-${arch}-portable.${ext}
+# rpm: electron-builder's default depends (gtk3, libnotify, nss, …). GTK 4 and
+# the WebP pixbuf loader the native pet wants are not required here (RHEL
+# ships webp-pixbuf-loader only in EPEL): without them the pet falls back to
+# the Electron pet window.
+# Flatpak (beta): Flathub's current runtime + Electron base app (the builder
+# default, 20.08, is end-of-life). The sandbox needs the tray
+# (StatusNotifier), the Secret Service for safeStorage and notifications.
+# Flatpak builds never self-update (no update info is written for them).
+flatpak:
+  runtimeVersion: '25.08'
+  baseVersion: '25.08'
+  finishArgs:
+    - --socket=wayland
+    - --socket=x11
+    - --share=ipc
+    - --device=dri
+    - --socket=pulseaudio
+    - --share=network
+    - --filesystem=home
+    - --talk-name=org.freedesktop.Notifications
+    - --talk-name=org.kde.StatusNotifierWatcher
+    - --talk-name=org.freedesktop.secrets

@@ -14,10 +14,18 @@
 #      semver; it must be HIGHER than the current release).
 #   2. From desktop/: `bun run publish:release` — syncs sources to the
 #      public repo, commits, tags vX.Y.Z, pushes.
-#   3. The tag push triggers this workflow, which builds mac (dmg+zip,
-#      universal), win (nsis) and linux (AppImage+deb) in parallel and
+#   3. The tag push triggers this workflow, which builds in parallel and
 #      publishes them + electron-updater metadata (latest*.yml) to the
-#      GitHub Release for that tag ON THE PUBLIC REPO.
+#      GitHub Release for that tag ON THE PUBLIC REPO:
+#        - macOS: dmg (Apple Silicon, Intel, universal) + zip (arm64, x64)
+#        - Windows: NSIS installer + portable exe (x64, arm64)
+#        - Linux x64 and arm64: AppImage, .deb, .rpm, .tar.gz
+#          (scripts/linux-release.mjs: one electron-builder run per package
+#          type, merged latest-linux*.yml — see its header for why)
+#        - Linux Flatpak (beta, x64): its own job, allowed to fail
+#      The names the site links are listed in desktop/electron-builder.yml;
+#      the pre-0.2.4 names TracingInsights-mac.dmg / TracingInsights-win.exe
+#      are re-uploaded as copies so old links keep working.
 #
 # Code signing (optional but required for macOS auto-update) — set these as
 # secrets on the PUBLIC TracingInsights/desktop repo:
@@ -47,18 +55,43 @@ concurrency:
 
 jobs:
   build:
-    name: Build + publish (${{ matrix.os }})
+    name: Build + publish (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            electron-builder-args: --mac
-          - os: windows-latest
-            electron-builder-args: --win
-          - os: ubuntu-latest
-            electron-builder-args: --linux
+          - name: macOS
+            os: macos-latest
+            # Both macOS arches: the universal dmg carries both binaries.
+            pet: darwin
+            build: bunx electron-builder --mac --publish always
+            legacy: TracingInsights-mac-universal.dmg=TracingInsights-mac.dmg
+          - name: Windows
+            os: windows-latest
+            # No win32-arm64 pin yet: the arm64 builds run the Electron pet.
+            pet: win32-x64
+            build: bunx electron-builder --win --publish always
+            legacy: TracingInsights-win-x64.exe=TracingInsights-win.exe
+          - name: Linux x64
+            os: ubuntu-latest
+            pet: linux-x64
+            rpm: true
+            build: bun run scripts/linux-release.mjs --arch x64 --publish
+          - name: Linux arm64
+            os: ubuntu-latest
+            # Cross-built on x64 (no native modules). No linux-arm64 pin yet.
+            pet: ''
+            rpm: true
+            build: bun run scripts/linux-release.mjs --arch arm64 --publish
+          - name: Linux Flatpak (beta)
+            os: ubuntu-latest
+            pet: linux-x64
+            flatpak: true
+            experimental: true
+            build: bunx electron-builder --linux flatpak --x64 --publish always
     runs-on: ${{ matrix.os }}
+    # The Flatpak is beta: a Flathub hiccup must not fail the release.
+    continue-on-error: ${{ matrix.experimental == true }}
     timeout-minutes: 60
     env:
       # Optional code-signing credentials — see header comment. Absent secrets
@@ -71,6 +104,12 @@ jobs:
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      # Set the repo variable DESKTOP_RELEASE_DRAFT=true to publish into a
+      # DRAFT release (electron-builder's EP_DRAFT): installed apps never see
+      # a draft, so a new installer matrix can be checked before it goes out
+      # (then: gh release edit vX.Y.Z --draft=false --latest). Unset → a
+      # normal release.
+      EP_DRAFT: ${{ vars.DESKTOP_RELEASE_DRAFT }}
       # Windows runners sometimes cannot create hard links for electron-builder
       # (EPERM on the CI filesystem); the copy fallback avoids the failure.
       USE_HARD_LINKS: 'false'
@@ -106,13 +145,23 @@ jobs:
       # into resources/ti-pet/ (electron-builder extraResources). Unpinned →
       # a warning and an installer without it (Electron pet fallback).
       - name: Fetch the pinned native pet
+        if: matrix.pet != ''
         shell: bash
+        run: bun run scripts/fetch-native-pet.mjs --write --target "${{ matrix.pet }}"
+
+      # fpm needs rpmbuild for the .rpm packages.
+      - name: Install rpm tooling
+        if: matrix.rpm
+        run: sudo apt-get update && sudo apt-get install -y rpm
+
+      # electron-builder's Flatpak target installs the Freedesktop runtime +
+      # Electron base app (electron-builder.yml → flatpak) from Flathub.
+      - name: Install flatpak-builder + Flathub
+        if: matrix.flatpak
         run: |
-          case "${{ matrix.os }}" in
-            macos-*) bun run scripts/fetch-native-pet.mjs --write --target darwin ;;
-            windows-*) bun run scripts/fetch-native-pet.mjs --write --target win32-x64 ;;
-            *) bun run scripts/fetch-native-pet.mjs --write --target linux-x64 ;;
-          esac
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
       # electron-builder publishes to the release for the pushed tag: with the
       # default vPrefixedTagName its computed tag (v<package version>) matches
@@ -132,6 +181,22 @@ jobs:
             APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
             if [ -z "${!var}" ]; then unset "$var"; fi
           done
-          bunx electron-builder ${{ matrix.electron-builder-args }} --publish always
+          ${{ matrix.build }}
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pre-0.2.4 download links (README, old pages, posts) name
+      # TracingInsights-mac.dmg / TracingInsights-win.exe: upload a copy under
+      # the old name. No latest*.yml lists it, so updates never fetch it.
+      - name: Upload the legacy-name copy
+        if: matrix.legacy != '' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          src="${LEGACY%%=*}"
+          dst="${LEGACY#*=}"
+          mkdir -p legacy
+          cp "release/$src" "legacy/$dst"
+          gh release upload "$GITHUB_REF_NAME" "legacy/$dst" --clobber --repo "$GITHUB_REPOSITORY"
+        env:
+          LEGACY: ${{ matrix.legacy }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

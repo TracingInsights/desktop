@@ -81,6 +81,7 @@ import {
 import { isAskPath } from './pets/ask-window.mjs';
 import { createNotifier } from './pets/notify.mjs';
 import { attachZoomKeys } from './zoom-keys.mjs';
+import { selfUpdateSupport } from './update-support.mjs';
 import updaterPkg from 'electron-updater';
 const { autoUpdater } = updaterPkg;
 
@@ -373,6 +374,18 @@ let hiddenForInstall = false;
 /** `window-all-closed` came while the install was armed. */
 let allClosedHeld = false;
 let updaterSetUp = false;
+/**
+ * The portable Windows exe, the Linux .tar.gz and the Flatpak cannot update
+ * in place (src/update-support.mjs): no updater, and the menu links the
+ * download page instead of "Check for Updates…".
+ */
+const SELF_UPDATE = selfUpdateSupport({
+  isPackaged: app.isPackaged,
+  platform: process.platform,
+  env: process.env,
+  resourcesPath: process.resourcesPath,
+  exists: existsSync
+});
 
 /**
  * "Restart to update" found nothing to install (no update, or the check or
@@ -413,7 +426,11 @@ function installUpdate() {
 }
 
 function setupAutoUpdater() {
-  if (!app.isPackaged || updaterSetUp) return;
+  if (!SELF_UPDATE) {
+    cancelInstallWhenDownloaded();
+    return;
+  }
+  if (updaterSetUp) return;
   updaterSetUp = true;
 
   // Download in the background; install on quit or from "Restart to update".
@@ -499,7 +516,11 @@ function setupAutoUpdater() {
 }
 
 function checkForUpdates(manual = false) {
-  if (!app.isPackaged || checkingForUpdates) return;
+  if (!SELF_UPDATE) {
+    cancelInstallWhenDownloaded();
+    return;
+  }
+  if (checkingForUpdates) return;
   checkingForUpdates = true;
   lastCheckWasManual = manual;
   autoUpdater.checkForUpdates().catch((error) => {
@@ -538,11 +559,25 @@ function buildMenu() {
               label: `Restart to Update (${updateReadyVersion})`,
               click: () => installUpdate()
             }
-          : {
-              label: 'Check for Updates…',
-              enabled: app.isPackaged,
-              click: () => checkForUpdates(true)
-            },
+          : SELF_UPDATE || !app.isPackaged
+            ? {
+                label: 'Check for Updates…',
+                enabled: app.isPackaged,
+                click: () => checkForUpdates(true)
+              }
+            : {
+                label: 'Download the Latest Version…',
+                click: () => {
+                  void shell
+                    .openExternal(`${APP_URL}/download`)
+                    .catch((error) =>
+                      console.warn(
+                        '[shell] could not open external URL:',
+                        error
+                      )
+                    );
+                }
+              },
         // Closing the window keeps the app in the tray, so Windows/Linux
         // need an explicit Quit here (macOS has it in the app menu).
         ...(process.platform === 'darwin'

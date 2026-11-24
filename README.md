@@ -21,12 +21,12 @@ LM Studio / vLLM / llama.cpp on `127.0.0.1`) or a hosted OpenAI-compatible
 endpoint (Fireworks, Together, DeepInfra, …), speaking one of three wire
 protocols (`openai-completions`, `openai-responses`, `anthropic-messages`).
 
-The tif1 fine-tuned model also runs **in the window itself** over WebGPU
+The tif1 fine-tuned model runs **in the window itself** over WebGPU
 (provider "In-browser (WebGPU)", `docs/browser-model.md`): its requests stay
 in the renderer (the engine lives in the page), never in the main-process
-harness. Settings → AI provider → On-device model chooses between it and a
-llama-server custom provider (`docs/local-model.md`); the default is
-`DESKTOP_LOCAL_RUNTIME_DEFAULT` in `src/lib/ai/webgpu/settings.svelte.ts`.
+harness. This is the only way the app runs it; there is no llama-server
+option for tif1 (the engine is faster). On Linux the shell turns on the
+WebGPU and Vulkan switches itself (`src/main.mjs`).
 
 ## How it works
 
@@ -242,10 +242,35 @@ Ship a desktop update like this:
    `.github/workflows/desktop-release.yml`, commits, tags `vX.Y.Z`, and
    pushes. It refuses to re-use a tag that already exists remotely.
 
-3. The tag push triggers the public repo's workflow, which builds **mac**
-   (dmg + zip, universal), **win** (nsis) and **linux** (AppImage + deb) in
+3. The tag push triggers the public repo's workflow, which builds in
    parallel and publishes them — with electron-updater metadata
-   (`latest*.yml`) — to the GitHub Release for that tag.
+   (`latest*.yml`) — to the GitHub Release for that tag:
+
+   | Job            | Files                                                                                             | Updates in place            |
+   | -------------- | ------------------------------------------------------------------------------------------------- | --------------------------- |
+   | macOS          | `-mac-arm64.dmg`, `-mac-x64.dmg`, `-mac-universal.dmg` (+ arm64 / x64 `.zip` update payloads)     | needs Developer ID signing  |
+   | Windows        | `-win-x64.exe`, `-win-arm64.exe` (installers), `-win-x64-portable.exe`, `-win-arm64-portable.exe` | installers yes, portable no |
+   | Linux x64      | `-linux.AppImage`, `-linux.deb`, `-linux.rpm`, `-linux.tar.gz`                                    | AppImage, deb, rpm          |
+   | Linux arm64    | the same as `-linux-arm64.*` (cross-built on x64)                                                 | AppImage, deb, rpm          |
+   | Flatpak (beta) | `-linux.flatpak` (x64; allowed to fail)                                                           | no                          |
+
+   Every name starts with `TracingInsights`. Linux goes through
+   `scripts/linux-release.mjs` (one electron-builder run per package type,
+   then one merged `latest-linux*.yml`): electron-builder packs all Linux
+   targets of one run in parallel from one folder, and the deb / rpm
+   `resources/package-type` marker (which selects electron-updater's
+   DebUpdater / RpmUpdater) could race into the other packages.
+   deb / rpm updates ask for the admin password (`pkexec`). Copies of the
+   x64 installer and the universal dmg are also uploaded under the pre-0.2.4
+   names `TracingInsights-win.exe` / `TracingInsights-mac.dmg`.
+
+   The app turns its updater off where it cannot update in place
+   (`src/update-support.mjs`: portable exe, tar.gz, Flatpak) and offers
+   "Download the Latest Version…" instead.
+
+4. Refresh the site's download page snapshot from the repo root:
+   `bun run fetch:desktop-release --write` (sizes + which files exist; the
+   page also refreshes from the GitHub API in the browser).
 
 First time only, create the public repo (or let the script tell you):
 
@@ -258,13 +283,13 @@ gh repo create TracingInsights/desktop --public \
 `artifactName` in `electron-builder.yml`):
 
 - Releases page: `https://github.com/TracingInsights/desktop/releases/latest`
-- `…/releases/latest/download/TracingInsights-mac.dmg`
-- `…/releases/latest/download/TracingInsights-win.exe`
-- `…/releases/latest/download/TracingInsights-linux.AppImage`
+- `…/releases/latest/download/<file>` for every file in the table above
 
-The site's Settings links these for non-desktop visitors
-(`DESKTOP_DOWNLOAD_LINKS` in `src/lib/ai/desktop-bridge.ts` — keep it in sync
-with `artifactName`).
+The site's `/download` page lists every file
+(`src/lib/desktop-downloads/catalog.ts`, sizes from
+`src/lib/desktop-downloads/release.json`); `/settings/pets` keeps one link
+per OS (`DESKTOP_DOWNLOAD_LINKS` in `src/lib/ai/desktop-bridge.ts`, the
+legacy names). Keep both in sync with the artifact names.
 
 The app checks for updates ~10 s after launch, every 6 hours while it runs
 (closing the window keeps it in the tray, so it can run for days) and via
@@ -279,7 +304,7 @@ offer "Restart to update", and otherwise it installs on quit. Dev runs
 | -------- | -------------------------------- | -------------------------------------------------------------------------------- |
 | macOS    | Developer ID cert + notarization | Apps install with Gatekeeper warnings and **cannot** self-update on modern macOS |
 | Windows  | Authenticode cert (optional)     | SmartScreen "unknown publisher" warning; auto-update still works                 |
-| Linux    | none (AppImage)                  | Auto-update works for AppImage builds; `.deb` installs update via apt instead    |
+| Linux    | none                             | AppImage, `.deb` and `.rpm` update in place; `.tar.gz` and Flatpak do not        |
 
 Set `CSC_LINK` / `CSC_KEY_PASSWORD` (+ `APPLE_ID`,
 `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID` for notarization) as
@@ -302,7 +327,8 @@ drifted (same contract as the stats manifest checks).
   public `TracingInsights/desktop` repo and tags `vX.Y.Z`; the
   workflow template `release-template/desktop-release.yml` becomes that
   repo's build-and-publish workflow. Download URLs for the site live in
-  `src/lib/ai/desktop-bridge.ts` (`DESKTOP_DOWNLOAD_LINKS`).
+  `src/lib/desktop-downloads/catalog.ts` (`/download`) and
+  `src/lib/ai/desktop-bridge.ts` (`DESKTOP_DOWNLOAD_LINKS`, one per OS).
 - Harness client: `src/lib/ai/desktop-harness.ts` (typed IPC helpers +
   `isDesktopShell`); `src/lib/ai/desktop-bridge.ts` keeps only the download
   links + shell detection.
