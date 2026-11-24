@@ -5,6 +5,10 @@
  *   build/icon.png  — 1024×1024 (Linux + master source)
  *   build/icon.icns — macOS (multi-size, incl. 1024 for Retina)
  *   build/icon.ico  — Windows (16–256)
+ *   build/icons/<N>x<N>.png — Linux icon set, 16–512 (desktop entries, docks,
+ *                    Flatpak, which drops icons larger than 512 px)
+ *   src/app-icon.png — 256 px window icon packaged with the app (Linux and
+ *                    Windows windows / taskbars; build/ is not in the asar)
  *
  * Pipeline: the 400×400 logo PNG is embedded as a data URL in a tiny SVG
  * wrapper, resvg-wasm renders it → 1024 PNG; png2icons converts the PNG to
@@ -31,6 +35,10 @@ const DESKTOP_DIR = join(__dirname, '..');
 const BUILD_DIR = join(DESKTOP_DIR, 'build');
 const SOURCE_PNG = join(DESKTOP_DIR, 'assets', 'icon.png');
 const ICON_SIZE = 1024;
+const LINUX_SIZES = [16, 32, 48, 64, 128, 256, 512];
+const ICONS_DIR = join(BUILD_DIR, 'icons');
+const APP_ICON = join(DESKTOP_DIR, 'src', 'app-icon.png');
+const APP_ICON_SIZE = 256;
 
 // ---------------------------------------------------------------------------
 // resvg-wasm init (same pattern as src/lib/og/generate.ts)
@@ -315,4 +323,23 @@ if (!icnsHas1024(icns)) {
 if (!icoHas256(ico)) {
   throw new Error('icon.ico is missing a 256×256 entry');
 }
+// Linux icon set + the packaged window icon, each rendered from the logo at
+// its own size (sharper than downscaling the 1024 render).
+const svgAt = (size) =>
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}"><image href="data:image/png;base64,${logo.toString('base64')}" width="${size}" height="${size}"/></svg>`;
+rmSync(ICONS_DIR, { recursive: true, force: true });
+mkdirSync(ICONS_DIR, { recursive: true });
+for (const size of LINUX_SIZES) {
+  const out = renderPng(svgAt(size), size);
+  const check = decodePng(out);
+  if (check.width !== size || !isNearGreen(samplePixel(check, 1, 1))) {
+    throw new Error(`build/icons/${size}x${size}.png failed its check`);
+  }
+  writeFileSync(join(ICONS_DIR, `${size}x${size}.png`), out);
+}
+console.log(`  wrote build/icons/ (${LINUX_SIZES.join(', ')} px)`);
+const appIcon = renderPng(svgAt(APP_ICON_SIZE), APP_ICON_SIZE);
+writeFileSync(APP_ICON, appIcon);
+console.log(`  wrote src/app-icon.png (${APP_ICON_SIZE} px)`);
+
 console.log('\nAll icon checks passed.');

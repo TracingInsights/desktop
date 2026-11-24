@@ -41,8 +41,15 @@
 #     warnings), Linux optional. macOS auto-update only works for signed +
 #     notarized apps. Signing secrets are set on the PUBLIC releases repo.
 
+# Branding: productName stays "TracingInsights" — it names the install
+# folder, the user-data folder (keys, pets) and every download, so changing
+# it would strand existing installs. The logo is assets/icon.png (the site's
+# TracingInsights.com-Logo-400x400.png) → build/ + src/app-icon.png via
+# `bun run icons`; the description (Linux menus, package managers) and the
+# homepage come from package.json.
 appId: com.tracinginsights.desktop
 productName: TracingInsights
+copyright: Copyright © 2026 TracingInsights
 artifactName: ${productName}-${os}.${ext}
 directories:
   output: release
@@ -102,7 +109,16 @@ win:
     - target: portable
       arch: [x64, arm64]
 linux:
-  icon: build/icon.png
+  # Icon set 16–512 px (Flatpak drops icons larger than 512 px).
+  icon: build/icons
+  # package.json desktopName = the .desktop file name, so the window's
+  # app_id / WM_CLASS matches its menu entry and docks show the logo.
+  syncDesktopName: true
+  desktop:
+    entry:
+      Name: TracingInsights
+      GenericName: F1 Statistics
+      Keywords: F1;Formula 1;Formula One;Motorsport;Telemetry;Statistics;Racing;
   # Build these through scripts/linux-release.mjs (one electron-builder run
   # per package type), not `electron-builder --linux`: one run packs them in
   # parallel from one folder that the deb / rpm `package-type` marker is
@@ -115,7 +131,8 @@ linux:
     - rpm
     - tar.gz
   category: Utility
-  synopsis: F1 statistics, telemetry and an AI chat that runs through your machine
+  synopsis: F1 statistics, telemetry, race ratings and an AI chat
+  vendor: TracingInsights
 deb:
   # electron-builder's defaults (FpmTarget) + what the native pet needs: GTK 4
   # and the WebP loader for gdk-pixbuf (Petdex sprites are WebP). Setting

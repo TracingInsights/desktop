@@ -54,8 +54,47 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # One job creates the release (as a draft) before the builds: when every
+  # build job created its own, GitHub ended up with two v0.2.4 drafts that
+  # each held part of the files. The builds upload into this draft; the
+  # finalize job publishes it once every required build has passed.
+  prepare:
+    name: Create the draft release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create the draft release with its title and notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists"
+            exit 0
+          fi
+          cat > notes.md <<'NOTES'
+          Download the right build for your computer at **https://tracinginsights.com/download**, or pick a file below.
+
+          | Platform | File |
+          | --- | --- |
+          | Windows (installer, 64-bit) | `TracingInsights-win-x64.exe` |
+          | Windows (portable, 64-bit) | `TracingInsights-win-x64-portable.exe` |
+          | Windows on Arm (installer / portable) | `TracingInsights-win-arm64.exe` / `TracingInsights-win-arm64-portable.exe` |
+          | macOS (Apple Silicon / Intel / Universal) | `TracingInsights-mac-arm64.dmg` / `TracingInsights-mac-x64.dmg` / `TracingInsights-mac-universal.dmg` |
+          | Linux x64 | `.AppImage`, `.deb`, `.rpm`, `.tar.gz`, `.flatpak` (beta) — `TracingInsights-linux.*` |
+          | Linux arm64 | `.AppImage`, `.deb`, `.rpm`, `.tar.gz` — `TracingInsights-linux-arm64.*` |
+
+          Installed apps update themselves (Windows installers, Linux AppImage / .deb / .rpm). The builds are not code-signed yet: on Windows choose *More info → Run anyway*; on macOS right-click the app → *Open* the first time.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag \
+            --title "TracingInsights ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md
+
   build:
     name: Build + publish (${{ matrix.name }})
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -104,12 +143,9 @@ jobs:
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      # Set the repo variable DESKTOP_RELEASE_DRAFT=true to publish into a
-      # DRAFT release (electron-builder's EP_DRAFT): installed apps never see
-      # a draft, so a new installer matrix can be checked before it goes out
-      # (then: gh release edit vX.Y.Z --draft=false --latest). Unset → a
-      # normal release.
-      EP_DRAFT: ${{ vars.DESKTOP_RELEASE_DRAFT }}
+      # Upload into the prepare job's draft (electron-builder's EP_DRAFT);
+      # installed apps never see a draft. The finalize job publishes it.
+      EP_DRAFT: 'true'
       # Windows runners sometimes cannot create hard links for electron-builder
       # (EPERM on the CI filesystem); the copy fallback avoids the failure.
       USE_HARD_LINKS: 'false'
@@ -138,7 +174,8 @@ jobs:
       - name: Verify committed icons match the source logo
         run: |
           bun run icons
-          git diff --exit-code -- build/
+          git status --porcelain -- build/ src/app-icon.png
+          test -z "$(git status --porcelain -- build/ src/app-icon.png)"
 
       # Native pet (docs/DESKTOP_PETS_NATIVE_PLAN.md N5): download the
       # ti-pet binaries pinned in native-pet.json and verify their SHA-256
@@ -200,3 +237,19 @@ jobs:
         env:
           LEGACY: ${{ matrix.legacy }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publish the draft once every required build passed (the Flatpak job may
+  # fail: continue-on-error). Repo variable DESKTOP_RELEASE_DRAFT=true keeps
+  # it a draft for a manual check instead; publish it later with
+  # gh release edit vX.Y.Z --draft=false --latest.
+  finalize:
+    name: Publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') && vars.DESKTOP_RELEASE_DRAFT != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Publish the draft as the latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest

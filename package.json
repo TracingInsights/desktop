@@ -2,12 +2,13 @@
   "name": "tif1ai-desktop",
   "version": "0.2.4",
   "private": true,
-  "description": "TracingInsights desktop app — a main-process inference harness that lets ChatGPT Codex, Grok (SuperGrok), and user-supplied custom providers run through the user's machine instead of the server.",
+  "description": "F1 statistics, telemetry, race ratings and an AI chat about Formula 1 history, from TracingInsights. Runs ChatGPT Codex, Grok and your own models through your computer.",
+  "desktopName": "tif1ai-desktop.desktop",
   "author": {
     "name": "TracingInsights",
     "email": "101667461+TracingInsights@users.noreply.github.com"
   },
-  "homepage": "https://github.com/TracingInsights/desktop",
+  "homepage": "https://tracinginsights.com/download",
   "type": "module",
   "main": "src/main.mjs",
   "scripts": {

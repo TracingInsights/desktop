@@ -281,10 +281,16 @@ function isOAuthProviderOrigin(url) {
 function createWindow(path) {
   // Opened during a hidden install start: a cancel no longer shows one.
   hiddenForInstall = false;
-  const devIconPath = join(__dirname, '..', 'build', 'icon.png');
+  // The logo as the window / taskbar icon on Windows and Linux: packaged
+  // builds read src/app-icon.png from the asar (build/ is not shipped), so
+  // an AppImage or tar.gz window no longer shows Electron's default icon.
+  const windowIconPath = [
+    join(__dirname, 'app-icon.png'),
+    join(__dirname, '..', 'build', 'icon.png')
+  ].find((path) => existsSync(path));
   const windowIcon =
-    process.platform !== 'darwin' && existsSync(devIconPath)
-      ? { icon: devIconPath }
+    process.platform !== 'darwin' && windowIconPath
+      ? { icon: windowIconPath }
       : {};
 
   mainWindow = new BrowserWindow({
